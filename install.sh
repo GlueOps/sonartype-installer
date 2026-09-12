@@ -611,19 +611,68 @@ create_if_missing "kubernetes-v1-34" "/service/rest/v1/repositories/apt/proxy" \
   "{\"name\":\"kubernetes-v1-34\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://pkgs.k8s.io/core:/stable:/v1.34/deb/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"/\",\"flat\":true}}"
 create_if_missing "kubernetes-v1-35" "/service/rest/v1/repositories/apt/proxy" \
   "{\"name\":\"kubernetes-v1-35\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://pkgs.k8s.io/core:/stable:/v1.35/deb/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"/\",\"flat\":true}}"
+create_if_missing "kubernetes-v1-36" "/service/rest/v1/repositories/apt/proxy" \
+  "{\"name\":\"kubernetes-v1-36\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://pkgs.k8s.io/core:/stable:/v1.36/deb/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"/\",\"flat\":true}}"
+create_if_missing "kubernetes-v1-37" "/service/rest/v1/repositories/apt/proxy" \
+  "{\"name\":\"kubernetes-v1-37\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://pkgs.k8s.io/core:/stable:/v1.37/deb/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"/\",\"flat\":true}}"
 
 create_if_missing "helm-apt" "/service/rest/v1/repositories/apt/proxy" \
   "{\"name\":\"helm-apt\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://packages.buildkite.com/helm-linux/helm-debian/any/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"any\",\"flat\":false}}"
 
+# docker-ce, docker-ce-cli, containerd.io and the buildx/compose plugins come from Docker's
+# own suite, not from the distro. One repository per suite, because a Nexus apt proxy pins a
+# single distribution -- same shape as the ubuntu-* and debian-* proxies above. The path
+# segment differs too: Docker publishes linux/ubuntu and linux/debian as separate trees.
+create_if_missing "docker-ubuntu-jammy" "/service/rest/v1/repositories/apt/proxy" \
+  "{\"name\":\"docker-ubuntu-jammy\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://download.docker.com/linux/ubuntu\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"jammy\",\"flat\":false}}"
+create_if_missing "docker-ubuntu-noble" "/service/rest/v1/repositories/apt/proxy" \
+  "{\"name\":\"docker-ubuntu-noble\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://download.docker.com/linux/ubuntu\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"noble\",\"flat\":false}}"
+create_if_missing "docker-debian-bookworm" "/service/rest/v1/repositories/apt/proxy" \
+  "{\"name\":\"docker-debian-bookworm\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://download.docker.com/linux/debian\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"bookworm\",\"flat\":false}}"
+create_if_missing "docker-debian-trixie" "/service/rest/v1/repositories/apt/proxy" \
+  "{\"name\":\"docker-debian-trixie\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://download.docker.com/linux/debian\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"apt\":{\"distribution\":\"trixie\",\"flat\":false}}"
+
 log "Creating Helm chart proxies + raw binaries proxies (blobStoreName=${BLOBSTORE_NAME})"
 create_if_missing "helm-stable" "/service/rest/v1/repositories/helm/proxy" \
   "{\"name\":\"helm-stable\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://charts.helm.sh/stable\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true}}"
+
+# The chart repositories a cluster build actually resolves against. helm-stable above is the
+# archived charts.helm.sh/stable, frozen since 2020 and kept only because removing the line
+# would orphan the repository on hosts that already have it -- this script never deletes.
+create_if_missing "helm-tigera" "/service/rest/v1/repositories/helm/proxy" \
+  "{\"name\":\"helm-tigera\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://docs.tigera.io/calico/charts\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true}}"
+create_if_missing "helm-metrics-server" "/service/rest/v1/repositories/helm/proxy" \
+  "{\"name\":\"helm-metrics-server\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://kubernetes-sigs.github.io/metrics-server\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true}}"
+create_if_missing "helm-containeroo" "/service/rest/v1/repositories/helm/proxy" \
+  "{\"name\":\"helm-containeroo\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":true},\"proxy\":{\"remoteUrl\":\"https://charts.containeroo.ch\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true}}"
 
 create_if_missing "raw-k8s" "/service/rest/v1/repositories/raw/proxy" \
   "{\"name\":\"raw-k8s\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":false,\"writePolicy\":\"ALLOW\"},\"proxy\":{\"remoteUrl\":\"https://dl.k8s.io/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"raw\":{\"contentDisposition\":\"ATTACHMENT\"}}"
 
 create_if_missing "raw-helm" "/service/rest/v1/repositories/raw/proxy" \
   "{\"name\":\"raw-helm\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":false,\"writePolicy\":\"ALLOW\"},\"proxy\":{\"remoteUrl\":\"https://get.helm.sh/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"raw\":{\"contentDisposition\":\"ATTACHMENT\"}}"
+
+# Signing keys, which every node fetches before it can add the suite the key signs. Proxied
+# at the host root rather than at the key itself so one repository covers both Docker trees:
+#   <mirror>/repository/raw-docker/linux/ubuntu/gpg
+#   <mirror>/repository/raw-buildkite-helm/gpgkey
+create_if_missing "raw-docker" "/service/rest/v1/repositories/raw/proxy" \
+  "{\"name\":\"raw-docker\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":false,\"writePolicy\":\"ALLOW\"},\"proxy\":{\"remoteUrl\":\"https://download.docker.com/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"raw\":{\"contentDisposition\":\"ATTACHMENT\"}}"
+create_if_missing "raw-buildkite-helm" "/service/rest/v1/repositories/raw/proxy" \
+  "{\"name\":\"raw-buildkite-helm\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":false,\"writePolicy\":\"ALLOW\"},\"proxy\":{\"remoteUrl\":\"https://packages.buildkite.com/helm-linux/helm-debian/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"raw\":{\"contentDisposition\":\"ATTACHMENT\"}}"
+
+# pkgs.k8s.io serves Release.key next to the suite, but Release.key is not a file an apt
+# proxy knows to fetch -- it recognises Release, InRelease, Release.gpg, Packages and pool/,
+# and nothing else. So the key needs a raw proxy even though the debs it signs do not. This
+# is pkgs.k8s.io; raw-k8s above is dl.k8s.io, a different host serving the binaries.
+create_if_missing "raw-pkgs-k8s" "/service/rest/v1/repositories/raw/proxy" \
+  "{\"name\":\"raw-pkgs-k8s\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":false,\"writePolicy\":\"ALLOW\"},\"proxy\":{\"remoteUrl\":\"https://pkgs.k8s.io/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"raw\":{\"contentDisposition\":\"ATTACHMENT\"}}"
+
+# Release assets (k9s and friends). A release download answers 302 to
+# objects.githubusercontent.com, which Nexus follows -- so egress from this host reaches a
+# CDN name that is not github.com. Allowlist both, or the fetch fails after the redirect.
+create_if_missing "raw-github" "/service/rest/v1/repositories/raw/proxy" \
+  "{\"name\":\"raw-github\",\"online\":true,\"storage\":{\"blobStoreName\":\"${BLOBSTORE_NAME}\",\"strictContentTypeValidation\":false,\"writePolicy\":\"ALLOW\"},\"proxy\":{\"remoteUrl\":\"https://github.com/\",\"contentMaxAge\":-1,\"metadataMaxAge\":1440},\"negativeCache\":{\"enabled\":false,\"timeToLive\":1440},\"httpClient\":{\"blocked\":false,\"autoBlock\":true},\"raw\":{\"contentDisposition\":\"ATTACHMENT\"}}"
 
 # -------- Prewarm (optional) --------
 if [[ "${PREWARM}" == "true" && -n "${PREWARM_IMAGES_FILE}" && -f "${PREWARM_IMAGES_FILE}" ]]; then

@@ -36,9 +36,56 @@ hostname is the only routing signal a `docker pull` sends.
 | `us-docker.pkg.dev` | `gcp.<BASE_DOMAIN>` | `us-docker-pkg-dev` | 5005 |
 | `gcr.io` | `gcr.<BASE_DOMAIN>` | `gcr-io` | 5006 |
 
-Plus APT proxies (Ubuntu jammy/noble, Debian bookworm/trixie, each with
-`-updates` and `-security`, Kubernetes `v1.32`–`v1.35`, Helm), a Helm chart
-proxy, and raw proxies for `dl.k8s.io` and `get.helm.sh`.
+Everything else is path-addressable, so it shares the one hostname
+`<BASE_DOMAIN>` and is reached at `https://<BASE_DOMAIN>/repository/<name>`.
+
+| Kind | Repos | Upstream |
+| --- | --- | --- |
+| APT | `ubuntu-jammy`, `ubuntu-noble` (+ `-updates`, `-security`) | `archive.ubuntu.com`, `security.ubuntu.com` |
+| APT | `debian-bookworm`, `debian-trixie` (+ `-updates`, `-security`) | `deb.debian.org`, `security.debian.org` |
+| APT | `kubernetes-v1-32` … `kubernetes-v1-37` | `pkgs.k8s.io/core:/stable:/vX.Y/deb/` |
+| APT | `helm-apt` | `packages.buildkite.com/helm-linux/helm-debian` |
+| APT | `docker-ubuntu-jammy`, `docker-ubuntu-noble` | `download.docker.com/linux/ubuntu` |
+| APT | `docker-debian-bookworm`, `docker-debian-trixie` | `download.docker.com/linux/debian` |
+| Helm | `helm-tigera` | `docs.tigera.io/calico/charts` |
+| Helm | `helm-metrics-server` | `kubernetes-sigs.github.io/metrics-server` |
+| Helm | `helm-containeroo` | `charts.containeroo.ch` |
+| Helm | `helm-stable` | `charts.helm.sh/stable` (archived upstream, see below) |
+| Raw | `raw-k8s` | `dl.k8s.io` |
+| Raw | `raw-helm` | `get.helm.sh` |
+| Raw | `raw-pkgs-k8s` | `pkgs.k8s.io` |
+| Raw | `raw-docker` | `download.docker.com` |
+| Raw | `raw-buildkite-helm` | `packages.buildkite.com/helm-linux/helm-debian` |
+| Raw | `raw-github` | `github.com` |
+
+A Nexus APT proxy pins one distribution, which is why each suite is its own
+repository rather than a component of a shared one.
+
+`helm-stable` fronts the Helm chart repository archived in 2020. It is kept
+because this script never deletes: dropping the line would leave the repository
+in place on every host that already ran an older version, with nothing in the
+script left to describe it.
+
+### Why signing keys need their own raw proxies
+
+A node cannot add a suite until it has the key that signs it, and an APT proxy
+will not serve that key. Nexus recognises `Release`, `InRelease`, `Release.gpg`,
+`Packages` and `pool/`, and refuses to fetch anything else from upstream — so
+`pkgs.k8s.io`'s `Release.key`, which sits directly beside the suite, is a 404
+through `kubernetes-v1-34` and has to come through `raw-pkgs-k8s` instead.
+
+That is also why `raw-docker` proxies the host root rather than a key path: one
+repository then covers both of Docker's trees.
+
+```
+https://<BASE_DOMAIN>/repository/raw-pkgs-k8s/core:/stable:/v1.34/deb/Release.key
+https://<BASE_DOMAIN>/repository/raw-docker/linux/ubuntu/gpg
+https://<BASE_DOMAIN>/repository/raw-buildkite-helm/gpgkey
+```
+
+`raw-github` is for release assets. A GitHub release download answers `302` to
+`objects.githubusercontent.com`; Nexus follows it, so the host needs egress to
+that CDN name as well as to `github.com`.
 
 To use a mirror, swap the upstream host for the mirror host and keep the rest of
 the reference:
@@ -154,11 +201,16 @@ existing repository is left exactly as it is.
 
 ## Adding a mirror
 
-A registry touches seven places in `install.sh`. `grep -n P_GCR install.sh` to
-see all of them at once: the port default, the regional and global derived
-hostnames, the compose `ports`/`expose` lists, the two Caddy site blocks, the
-`create_if_missing` proxy repository, the prewarm `case` arm, and the two
-summary tables.
+A **Docker** registry touches seven places in `install.sh`. `grep -n P_GCR
+install.sh` to see all of them at once: the port default, the regional and
+global derived hostnames, the compose `ports`/`expose` lists, the two Caddy site
+blocks, the `create_if_missing` proxy repository, the prewarm `case` arm, and
+the two summary tables.
+
+An APT, Helm or raw proxy touches one: a single `create_if_missing` line. It
+needs no port, no hostname and no Caddy block, because only the Docker registry
+protocol routes on the hostname — everything else is addressed by path under
+`<BASE_DOMAIN>`, which already has a certificate.
 
 DNS comes first — Caddy fails the ACME challenge for a name that does not
 resolve, and one failing site block is enough to keep Caddy from starting.

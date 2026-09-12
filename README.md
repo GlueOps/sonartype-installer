@@ -41,11 +41,11 @@ Everything else is path-addressable, so it shares the one hostname
 
 | Kind | Repos | Upstream |
 | --- | --- | --- |
-| APT | `ubuntu-jammy`, `ubuntu-noble` (+ `-updates`, `-security`) | `archive.ubuntu.com`, `security.ubuntu.com` |
+| APT | `ubuntu-jammy`, `ubuntu-noble`, `ubuntu-resolute` (+ `-updates`, `-security`) | `archive.ubuntu.com`, `security.ubuntu.com` |
 | APT | `debian-bookworm`, `debian-trixie` (+ `-updates`, `-security`) | `deb.debian.org`, `security.debian.org` |
 | APT | `kubernetes-v1-32` … `kubernetes-v1-37` | `pkgs.k8s.io/core:/stable:/vX.Y/deb/` |
 | APT | `helm-apt` | `packages.buildkite.com/helm-linux/helm-debian` |
-| APT | `docker-ubuntu-jammy`, `docker-ubuntu-noble` | `download.docker.com/linux/ubuntu` |
+| APT | `docker-ubuntu-jammy`, `docker-ubuntu-noble`, `docker-ubuntu-resolute` | `download.docker.com/linux/ubuntu` |
 | APT | `docker-debian-bookworm`, `docker-debian-trixie` | `download.docker.com/linux/debian` |
 | Helm | `helm-tigera` | `docs.tigera.io/calico/charts` |
 | Helm | `helm-metrics-server` | `kubernetes-sigs.github.io/metrics-server` |
@@ -60,6 +60,11 @@ Everything else is path-addressable, so it shares the one hostname
 
 A Nexus APT proxy pins one distribution, which is why each suite is its own
 repository rather than a component of a shared one.
+
+`resolute` is Ubuntu 26.04 LTS. The codename, not the number, is what an APT
+suite is addressed by, and it is also what `ansible_distribution_release` and
+friends hand you — so a mirror that tracks the number is a mirror that will be
+edited again in two years.
 
 `helm-stable` fronts the Helm chart repository archived in 2020. It is kept
 because this script never deletes: dropping the line would leave the repository

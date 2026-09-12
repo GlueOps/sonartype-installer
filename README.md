@@ -92,6 +92,58 @@ https://<BASE_DOMAIN>/repository/raw-buildkite-helm/gpgkey
 `objects.githubusercontent.com`; Nexus follows it, so the host needs egress to
 that CDN name as well as to `github.com`.
 
+### Why the raw proxies revalidate and the others do not
+
+Every `raw-*` repository sets `contentMaxAge: 0`; apt and Helm keep `-1`.
+
+The split is about whether a path is version-addressed. A `.deb` or a `.tgz`
+names its version, so the bytes at that path never legitimately change and
+caching them forever is correct — a TTL there would buy nothing but revalidation
+traffic. Raw has no such guarantee, and no metadata class either: Nexus cannot
+tell a pinned tarball from a mutable pointer, so *everything* in a raw
+repository is content and `-1` freezes all of it permanently.
+
+Two of these proxies front pointers that genuinely move:
+
+```
+dl.k8s.io/release/stable.txt     -> v1.37.0
+get.helm.sh/helm-latest-version  -> v4.3.0
+```
+
+And the signing keys are worse than stale, because the metadata they are checked
+against *does* refresh — `metadataMaxAge` is 1440 either way. A permanently
+cached key plus a fresh `Release` means the mirror serves a signature its own
+clients cannot verify, and an apt source pinned with `signed-by=` fails hard
+rather than falling back.
+
+`contentMaxAge: 0` does not mean "always fetch". Nexus issues a conditional
+request and serves the cache on a `304` — every upstream here supports that,
+including `pkgs.k8s.io` via its CDN redirect. It also serves the cache when
+revalidation fails outright, so an unreachable or erroring upstream degrades to
+the cached copy rather than to an error.
+
+### Changing a repository that already exists
+
+`create_if_missing` matches on name and nothing else. It will not reconcile a
+repository it finds, which is deliberate — it is what lets you tune a proxy in
+the UI without this script reverting you on the next run. The cost is that a
+settings change here does not reach a mirror that already ran an older version.
+
+To push one, `PUT` the full body; Nexus replaces rather than merges:
+
+```bash
+curl -u "admin:${NEXUS_NEW_ADMIN_PASSWORD}" -X PUT \
+  -H 'Content-Type: application/json' \
+  "https://${BASE_DOMAIN}/service/rest/v1/repositories/raw/proxy/raw-k8s" \
+  -d @- <<'JSON'
+{ ... the payload from install.sh, with contentMaxAge 0 ... }
+JSON
+```
+
+Only repositories whose definition changed need this. On a mirror built before
+the raw proxies revalidated, that is `raw-k8s` and `raw-helm`; the other four
+are new and get the right value from the create.
+
 To use a mirror, swap the upstream host for the mirror host and keep the rest of
 the reference:
 

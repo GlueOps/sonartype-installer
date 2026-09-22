@@ -112,6 +112,114 @@ closed on a path that would otherwise have worked.
 The consequence is an egress one: those three fetches need the client to reach
 the CDN. Nothing else is lost — no raw repository was caching anything anyway.
 
+## Adding a repository
+
+Every kind of upstream lives in one table near the top of
+`install-mirror-stack.sh`. Add a line, re-run the installer, done — it is
+idempotent and reloads only what changed.
+
+**The name you choose becomes a URL.** Clients fetch
+`https://<host>/repository/<name>/…`, so a rename is a breaking change for every
+`sources.list` and `helm repo add` pointing at it. Pick it once.
+
+### A Helm chart repository
+
+`HELM_REPOS`, as `name:upstream host:upstream path prefix`:
+
+```bash
+"helm-cilium:helm.cilium.io:"
+```
+
+Served at `/repository/helm-cilium/`, proxied to `https://helm.cilium.io/`.
+Leave the third field empty when the charts sit at the host root.
+
+### A raw HTTP proxy
+
+`RAW_REPOS`, same shape:
+
+```bash
+"raw-cni-plugins:github.com:/containernetworking/plugins/releases/download"
+```
+
+Raw proxies always revalidate against the upstream — there is no local copy to
+go stale — so this is the right table for anything whose content moves under a
+stable path.
+
+If the upstream answers with a redirect to a CDN, the client follows it itself;
+see *Redirects are passed through, not followed* above. That is a deliberate
+choice, not an oversight.
+
+### A container registry
+
+Two lines, and some DNS.
+
+`REGISTRIES`, as `name:subdomain:host port:upstream`:
+
+```bash
+"ecrpriv:ecrpriv:5007:https://123456789012.dkr.ecr.eu-west-1.amazonaws.com"
+```
+
+Then, **before deploying**:
+
+1. Create the DNS record for `<subdomain>.<BASE_DOMAIN>` — and for
+   `<subdomain>.<GLOBAL_BASE_DOMAIN>` if you run a global hostname.
+2. Pick an unused host port. The existing ones run 5000–5006.
+
+Each registry gets its own hostname because the Docker registry protocol has no
+way to select a backend from the path — the hostname is the only routing signal
+a `docker pull` sends.
+
+**Mind the certificate budget.** A new subdomain means a new regional ACME
+certificate per host. Let's Encrypt allows 50 per registered domain per week,
+and a three-host fleet already issues 8 per host. Adding registries in bulk, or
+rebuilding the fleet from empty afterwards, can exhaust that.
+
+If the upstream turns out to serve manifests but 500 on blobs, it is refusing
+`registry:2`'s token handling — move it to `PASSTHROUGH_REGISTRIES` instead,
+which is what `public.ecr.aws` needs. A passthrough answers 401 on `/v2/` rather
+than 200, because the upstream's challenge reaches the client unaltered.
+
+### An APT suite
+
+Two places, and the second one decides how much disk you use.
+
+First, `APT_REPOS` — this is only the routing list, so Caddy knows to send that
+prefix to apt-cacher-ng:
+
+```bash
+ubuntu-questing ubuntu-questing-updates ubuntu-questing-security
+```
+
+Second, a `Remap` line in the `acng.conf` heredoc. **Several local prefixes on
+one `Remap` share a single cache tree**, and that is the whole decision:
+
+```
+Remap-<name>: /repository/<a> /repository/<b> ; https://upstream/path
+```
+
+- **Merge** suites that differ only by the suite name in the path and share an
+  identical `pool/`. The nine `ubuntu-*` repositories are one `Remap` for
+  exactly this reason — separate trees would store every `.deb` nine times.
+- **Do not merge** archives that are genuinely separate.
+  `security.debian.org` has its own `pool/`, so it gets its own `Remap` even
+  though it is also Debian.
+- **Flat repositories** — `pkgs.k8s.io` publishes each Kubernetes minor as an
+  independent tree with nothing to share — get one `Remap` each.
+
+An upstream reachable only over HTTPS is fine as a target; remapping a plain
+client-facing path onto an HTTPS upstream is the documented way to cache one.
+
+After adding, confirm the suite actually resolves:
+
+```bash
+curl -sI https://<host>/repository/<name>/dists/<suite>/InRelease
+```
+
+A 404 there usually means the upstream does not carry that suite yet — Docker
+publishes no suite for an Ubuntu release on the day it ships — rather than that
+the `Remap` is wrong.
+
+
 ## `install.sh` (Nexus)
 
 ### What it builds

@@ -99,6 +99,15 @@ entries are all overdue.
 debug/pprof server on `:5001`). Keep the `REGISTRY_LOG_*` and
 `REGISTRY_HTTP_DEBUG_ADDR` overrides.
 
+**Helm and raw are nginx's, not Caddy's.** Caddy cannot cache, serve stale, or
+rewrite a response body, which is why those ten routes go to nginx behind it.
+Three settings there look optional and are not: `proxy_set_header
+Accept-Encoding "";` (sub_filter cannot touch a gzipped body, and every chart
+index serves gzip when asked), `proxy_buffer_size 32k` (GitHub's 302 carries a
+signed URL that overflows the 4k default and fails as "upstream sent too big
+header"), and `proxy_max_temp_file_size` being non-zero (nginx stages a response
+in a temp file on its way into the cache).
+
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and
 under `set -e` a failing probe kills the whole script silently. Write

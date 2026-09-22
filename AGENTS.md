@@ -115,6 +115,11 @@ directly, so a mirror hostname must rewrite single-segment repository names.
 change for different reasons, and those records are colon separated while a URL
 contains `://`, so a field added after the upstream gets a fragment of it.
 
+**Build and pull before stopping anything.** `docker compose up` fetches
+missing images after the teardown, which turns a registry problem into an
+outage. A public image refused with `denied` on a host means that host is
+sending a stale credential instead of pulling anonymously.
+
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and
 under `set -e` a failing probe kills the whole script silently. Write

@@ -836,9 +836,30 @@ fi
 # ---------------------------------------------------------------------------
 # Build before stopping anything. A failed image build with Nexus already down
 # is an outage for no reason.
-log "Building images (Nexus still serving)"
+log "Building images (current stack still serving)"
 cd "${STACK_DIR}"
 docker compose build
+
+# Pull before stopping anything, for the same reason the build happens first.
+#
+# `docker compose up` fetches what it does not have, which is after the teardown
+# -- so an unreachable registry, an expired credential or a withdrawn tag became
+# an outage rather than a refusal. One deploy has already hit this: a stale
+# ghcr.io credential on the host turned a public image into "error from
+# registry: denied", and the only reason the mirror stayed up is that compose
+# happened to fail before it replaced the running containers. That is luck, not
+# design.
+log "Pulling images (current stack still serving)"
+docker compose pull --quiet || die "could not pull one or more images; nothing has been stopped and the current stack is still serving.
+
+A public image failing here usually means this host is sending a stale
+credential rather than pulling anonymously -- docker sends any credential it
+holds, and an expired one is refused instead of falling back:
+
+  cat /root/.docker/config.json     # an auths entry for the registry
+  docker logout <registry>
+
+Then re-run."
 
 if [[ -f "${OLD_STACK_DIR}/docker-compose.yml" ]]; then
   log "Stopping Nexus"

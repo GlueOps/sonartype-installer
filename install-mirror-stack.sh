@@ -836,9 +836,30 @@ fi
 # ---------------------------------------------------------------------------
 # Build before stopping anything. A failed image build with Nexus already down
 # is an outage for no reason.
-log "Building images (Nexus still serving)"
+log "Building images (current stack still serving)"
 cd "${STACK_DIR}"
 docker compose build
+
+# Pull before stopping anything, for the same reason the build happens first.
+#
+# `docker compose up` fetches what it does not have, which is after the teardown
+# -- so an unreachable registry, an expired credential or a withdrawn tag became
+# an outage rather than a refusal. One deploy has already hit this: a stale
+# ghcr.io credential on the host turned a public image into "error from
+# registry: denied", and the only reason the mirror stayed up is that compose
+# happened to fail before it replaced the running containers. That is luck, not
+# design.
+log "Pulling images (current stack still serving)"
+docker compose pull --quiet || die "could not pull one or more images; nothing has been stopped and the current stack is still serving.
+
+A public image failing here usually means this host is sending a stale
+credential rather than pulling anonymously -- docker sends any credential it
+holds, and an expired one is refused instead of falling back:
+
+  cat /root/.docker/config.json     # an auths entry for the registry
+  docker logout <registry>
+
+Then re-run."
 
 if [[ -f "${OLD_STACK_DIR}/docker-compose.yml" ]]; then
   log "Stopping Nexus"
@@ -940,13 +961,28 @@ check "helm helm-metrics-server" '^200$' "https://${BASE_DOMAIN}/repository/helm
 # The chart URLs in an index must point back here, not at GitHub. A Helm client
 # reads this field and downloads from whatever it says, so if the rewrite stops
 # working every `helm install` silently leaves the mirror again.
-check "helm index rewritten" '^200$' \
-  "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"
-if curl -fsS --max-time 60 "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml" 2>/dev/null \
-     | grep -qE "^\s+- https://${BASE_DOMAIN}/repository/"; then
+#
+# Fetched and asserted separately, and retried. The first version of this check
+# piped `curl -fsS` straight into grep, so a 502 from Caddy while content-cache
+# was still starting reported itself as "chart urls still point upstream" -- a
+# confident, specific and entirely wrong diagnosis of a connection failure. It
+# failed a deploy that way once.
+helm_index=""
+for _ in $(seq 1 15); do
+  if helm_index="$(curl -fsS --max-time 60 \
+       "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml" 2>/dev/null)"; then
+    [[ -n "${helm_index}" ]] && break
+  fi
+  helm_index=""
+  sleep 2
+done
+if [[ -z "${helm_index}" ]]; then
+  printf '  FAIL  %-30s could not fetch the index at all\n' "helm url rewrite"
+  failed=$((failed + 1))
+elif grep -qE "^[[:space:]]+- https://${BASE_DOMAIN}/repository/" <<<"${helm_index}"; then
   printf '  ok    %-30s chart urls point here\n' "helm url rewrite"
 else
-  printf '  FAIL  %-30s chart urls still point upstream\n' "helm url rewrite"
+  printf '  FAIL  %-30s index served, but chart urls still point upstream\n' "helm url rewrite"
   failed=$((failed + 1))
 fi
 

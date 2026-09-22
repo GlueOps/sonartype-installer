@@ -53,6 +53,26 @@ registry cache uses the `filesystem` storage driver, and all six raw proxies ran
 is a faithful replacement and no HTTP cache module is needed. This runs the
 stock `caddy:2` image.
 
+### Nothing is stopped until everything is in hand
+
+Images are **built and pulled before the current stack is touched**. `docker
+compose up` otherwise fetches what it lacks *after* the teardown, so an
+unreachable registry, an expired credential or a withdrawn tag becomes an outage
+rather than a refusal.
+
+One deploy has already hit this: a stale `ghcr.io` credential on a host turned a
+public image into `error from registry: denied`, and the mirror only stayed up
+because compose happened to fail before replacing the running containers.
+
+A public image failing to pull usually means the host is sending a stale
+credential rather than pulling anonymously — docker sends any credential it
+holds, and an expired one is refused instead of falling back:
+
+```sh
+cat /root/.docker/config.json     # an auths entry for the registry
+docker logout <registry>
+```
+
 ### Migrating from Nexus
 
 If a stack built by `install.sh` is present, it is **stopped, not deleted**, and

@@ -1,5 +1,16 @@
 # sonartype-installer
 
+> **Nexus Repository Community Edition enforces usage limits from 15 October
+> 2026** — 40,000 components *or* 100,000 requests per day, and exceeding either
+> one blocks *adding new components* until you are back under **both**. For a
+> deployment that is entirely proxy repositories, **a cache miss is a component
+> addition**, so going over the request cap does not throttle the mirror: it
+> stops it caching anything it has not already cached.
+>
+> **[`install-mirror-stack.sh`](#install-mirror-stacksh) builds the same mirror
+> without Nexus**, and migrates a host that already runs one. `install.sh` below
+> is unchanged and still supported for deployments that stay under the limits.
+
 One shell script that turns a bare Linux host into a caching pull-through mirror
 for the public container registries, APT suites and Helm charts a Kubernetes
 cluster pulls from — Sonatype Nexus behind Caddy, with TLS, on a domain you own.
@@ -14,7 +25,204 @@ sudo BASE_DOMAIN=repo.example.com \
      bash install.sh
 ```
 
-## What it builds
+## `install-mirror-stack.sh`
+
+The same mirror, decomposed by protocol, with no licence meter.
+
+```bash
+sudo BASE_DOMAIN=repo.example.com \
+     ACME_EMAIL=admin@example.com \
+     bash install-mirror-stack.sh
+```
+
+| Was, under Nexus | Is |
+| --- | --- |
+| 27 apt proxy repositories | apt-cacher-ng, **12** `Remap` entries |
+| 7 docker proxy repositories | 6 × `registry:2` pull-through, plus ECR (below) |
+| 4 helm + 6 raw proxy repositories | Caddy `reverse_proxy`, straight to the upstream |
+| Nexus UI | a static index of what the host serves, plus `/healthz` |
+
+No admin user, no EULA, and no *Docker Bearer Token Realm* to switch on by hand
+after every rebuild. Client URLs are unchanged: `/repository/<name>/` is a Nexus
+path convention, but apt-cacher-ng's `Remap` and Caddy's `handle_path` reproduce
+it verbatim, so no `sources.list` or `helm repo add` in your estate has to move.
+
+Every cache is plain local disk. Upstream is explicit that a pull-through
+registry cache uses the `filesystem` storage driver, and all six raw proxies ran
+`contentMaxAge=0` under Nexus — always revalidate — so a plain `reverse_proxy`
+is a faithful replacement and no HTTP cache module is needed. This runs the
+stock `caddy:2` image.
+
+### Migrating from Nexus
+
+If a stack built by `install.sh` is present, it is **stopped, not deleted**, and
+its TLS material is carried across first. Rollback is a compose up in the old
+stack directory. On a host with no Nexus, that phase is skipped entirely.
+
+Images are built *before* anything is stopped, so a failed build is not an
+outage. `DRY_RUN=1` writes the compose file, Caddyfile and `acng.conf` and stops.
+
+### Two things that will bite you
+
+**Regional and global names cannot share a Caddy site block.** A wildcard for
+`repo.example.com` covers `repo.example.com` and `*.repo.example.com` — so
+`dockerhub.repo.example.com` is in scope. It does **not** cover
+`repo.eu-central.example.com`; that is a different name, not a subdomain. A
+`tls` directive applies to every address on its block, so merging them hands the
+regional names a certificate that does not match. The generated Caddyfile keeps
+them apart: regional on ACME, global on the pre-issued wildcard.
+
+**`X-Forwarded-*` is stripped from helm and raw upstream requests.** Those are
+third-party CDNs being fetched as an ordinary client, which is what Nexus did.
+`packages.buildkite.com` is the proof: it answers any request carrying an
+`X-Forwarded-Proto` with a 301 to its marketing site instead of the signed URL
+for the signing key — whether the value says `http` or `https`. The registry and
+apt routes keep their headers; those backends are yours.
+
+### `public.ecr.aws` is proxied, not cached
+
+`registry:2` cannot serve ECR Public. Distribution's pull-through proxy does not
+negotiate its anonymous token: it serves **manifests fine and answers 500 on
+every blob**, so `/v2/` and a manifest check both report a healthy registry while
+no image can actually be pulled. That is
+[distribution#4383](https://github.com/distribution/distribution/issues/4383),
+open since June 2024, and it fails with credentials supplied as well as without.
+Reproduced on a clean `registry:2` and on `registry:3`.
+
+So `ecr.` is the one registry Caddy proxies directly. The client does the token
+dance itself and ECR accepts its own token; the 401 challenge's realm is
+rewritten to point back at the mirror and `/token` is proxied onward, so a
+client still only ever talks to the mirror rather than needing its own egress to
+AWS. The cost is that ECR is not cached — which matters, because ECR Public
+rate-limits per source IP and a mirror concentrates a whole fleet onto one.
+
+### Redirects are passed through, not followed
+
+Nexus followed upstream redirects server-side, so a client only ever talked to
+the mirror. Caddy hands the 302 back instead. Three paths do this: `raw-github`
+release assets, `raw-pkgs-k8s/…/Release.key`, and `raw-buildkite-helm/gpgkey`.
+
+Rewriting `Location` back through the mirror was tried and removed. GitHub has
+already moved release assets from `objects.githubusercontent.com` to
+`release-assets.githubusercontent.com`, so a hardcoded CDN list is stale on
+arrival and silently becomes a no-op; buildkite hands out a CloudFront URL whose
+signature covers the exact URL and expires. A rewrite table that is wrong fails
+closed on a path that would otherwise have worked.
+
+The consequence is an egress one: those three fetches need the client to reach
+the CDN. Nothing else is lost — no raw repository was caching anything anyway.
+
+## Adding a repository
+
+Every kind of upstream lives in one table near the top of
+`install-mirror-stack.sh`. Add a line, re-run the installer, done — it is
+idempotent and reloads only what changed.
+
+**The name you choose becomes a URL.** Clients fetch
+`https://<host>/repository/<name>/…`, so a rename is a breaking change for every
+`sources.list` and `helm repo add` pointing at it. Pick it once.
+
+### A Helm chart repository
+
+`HELM_REPOS`, as `name:upstream host:upstream path prefix`:
+
+```bash
+"helm-cilium:helm.cilium.io:"
+```
+
+Served at `/repository/helm-cilium/`, proxied to `https://helm.cilium.io/`.
+Leave the third field empty when the charts sit at the host root.
+
+### A raw HTTP proxy
+
+`RAW_REPOS`, same shape:
+
+```bash
+"raw-cni-plugins:github.com:/containernetworking/plugins/releases/download"
+```
+
+Raw proxies always revalidate against the upstream — there is no local copy to
+go stale — so this is the right table for anything whose content moves under a
+stable path.
+
+If the upstream answers with a redirect to a CDN, the client follows it itself;
+see *Redirects are passed through, not followed* above. That is a deliberate
+choice, not an oversight.
+
+### A container registry
+
+Two lines, and some DNS.
+
+`REGISTRIES`, as `name:subdomain:host port:upstream`:
+
+```bash
+"ecrpriv:ecrpriv:5007:https://123456789012.dkr.ecr.eu-west-1.amazonaws.com"
+```
+
+Then, **before deploying**:
+
+1. Create the DNS record for `<subdomain>.<BASE_DOMAIN>` — and for
+   `<subdomain>.<GLOBAL_BASE_DOMAIN>` if you run a global hostname.
+2. Pick an unused host port. The existing ones run 5000–5006.
+
+Each registry gets its own hostname because the Docker registry protocol has no
+way to select a backend from the path — the hostname is the only routing signal
+a `docker pull` sends.
+
+**Mind the certificate budget.** A new subdomain means a new regional ACME
+certificate per host. Let's Encrypt allows 50 per registered domain per week,
+and a three-host fleet already issues 8 per host. Adding registries in bulk, or
+rebuilding the fleet from empty afterwards, can exhaust that.
+
+If the upstream turns out to serve manifests but 500 on blobs, it is refusing
+`registry:2`'s token handling — move it to `PASSTHROUGH_REGISTRIES` instead,
+which is what `public.ecr.aws` needs. A passthrough answers 401 on `/v2/` rather
+than 200, because the upstream's challenge reaches the client unaltered.
+
+### An APT suite
+
+Two places, and the second one decides how much disk you use.
+
+First, `APT_REPOS` — this is only the routing list, so Caddy knows to send that
+prefix to apt-cacher-ng:
+
+```bash
+ubuntu-questing ubuntu-questing-updates ubuntu-questing-security
+```
+
+Second, a `Remap` line in the `acng.conf` heredoc. **Several local prefixes on
+one `Remap` share a single cache tree**, and that is the whole decision:
+
+```
+Remap-<name>: /repository/<a> /repository/<b> ; https://upstream/path
+```
+
+- **Merge** suites that differ only by the suite name in the path and share an
+  identical `pool/`. The nine `ubuntu-*` repositories are one `Remap` for
+  exactly this reason — separate trees would store every `.deb` nine times.
+- **Do not merge** archives that are genuinely separate.
+  `security.debian.org` has its own `pool/`, so it gets its own `Remap` even
+  though it is also Debian.
+- **Flat repositories** — `pkgs.k8s.io` publishes each Kubernetes minor as an
+  independent tree with nothing to share — get one `Remap` each.
+
+An upstream reachable only over HTTPS is fine as a target; remapping a plain
+client-facing path onto an HTTPS upstream is the documented way to cache one.
+
+After adding, confirm the suite actually resolves:
+
+```bash
+curl -sI https://<host>/repository/<name>/dists/<suite>/InRelease
+```
+
+A 404 there usually means the upstream does not carry that suite yet — Docker
+publishes no suite for an Ubuntu release on the day it ships — rather than that
+the `Remap` is wrong.
+
+
+## `install.sh` (Nexus)
+
+### What it builds
 
 | Component | Where |
 | --- | --- |

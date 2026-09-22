@@ -68,7 +68,7 @@ ACNG_UID="${ACNG_UID:-8142}"
 # stock registry:2/registry:3 cannot (distribution#4383): ECR Public answers HEAD
 # on a blob with 401, and the proxy HEADs every blob before fetching it.
 # https://github.com/GlueOps/registry
-REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/glueops/registry:a36062c@sha256:3a335a80b3e06ec0af1a48102743329950ef0a1acf648ea187a0094c15b2047e}"
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/glueops/registry:v0.0.2@sha256:8cb6fbe5b2e5b969c917026d3f323fcdfceb5d7dab2c1960e26bccd852ca0e82}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "==> $*"; }

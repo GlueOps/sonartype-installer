@@ -108,6 +108,13 @@ signed URL that overflows the 4k default and fails as "upstream sent too big
 header"), and `proxy_max_temp_file_size` being non-zero (nginx stages a response
 in a temp file on its way into the cache).
 
+**Docker Hub needs the `library/` rewrite.** Official images live under
+`library/` and the docker daemon only adds that prefix when talking to Hub
+directly, so a mirror hostname must rewrite single-segment repository names.
+`OFFICIAL_NAMESPACE` is a separate table from `REGISTRIES` on purpose — the two
+change for different reasons, and those records are colon separated while a URL
+contains `://`, so a field added after the upstream gets a fragment of it.
+
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and
 under `set -e` a failing probe kills the whole script silently. Write

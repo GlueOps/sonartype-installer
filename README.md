@@ -38,7 +38,7 @@ sudo BASE_DOMAIN=repo.example.com \
 | Was, under Nexus | Is |
 | --- | --- |
 | 27 apt proxy repositories | apt-cacher-ng, **12** `Remap` entries |
-| 7 docker proxy repositories | 6 × `registry:2` pull-through, plus ECR (below) |
+| 7 docker proxy repositories | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
 | 4 helm + 6 raw proxy repositories | Caddy `reverse_proxy`, straight to the upstream |
 | Nexus UI | a static index of what the host serves, plus `/healthz` |
 
@@ -79,22 +79,31 @@ third-party CDNs being fetched as an ordinary client, which is what Nexus did.
 for the signing key — whether the value says `http` or `https`. The registry and
 apt routes keep their headers; those backends are yours.
 
-### `public.ecr.aws` is proxied, not cached
+### Registries run `ghcr.io/glueops/registry`
 
-`registry:2` cannot serve ECR Public. Distribution's pull-through proxy does not
-negotiate its anonymous token: it serves **manifests fine and answers 500 on
-every blob**, so `/v2/` and a manifest check both report a healthy registry while
-no image can actually be pulled. That is
-[distribution#4383](https://github.com/distribution/distribution/issues/4383),
-open since June 2024, and it fails with credentials supplied as well as without.
-Reproduced on a clean `registry:2` and on `registry:3`.
+Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`: ECR Public answers
+`HEAD` on a blob with 401, and Distribution's pull-through proxy HEADs every blob
+before fetching it, so every uncached pull fails
+([distribution#4383](https://github.com/distribution/distribution/issues/4383)).
+[`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) is upstream
+Distribution 3.1.1 with only that fixed, so `ecr.` is cached like every other
+registry and clients only ever talk to the mirror. It is pinned by digest in
+`REGISTRY_IMAGE`.
 
-So `ecr.` is the one registry Caddy proxies directly. The client does the token
-dance itself and ECR accepts its own token; the 401 challenge's realm is
-rewritten to point back at the mirror and `/token` is proxied onward, so a
-client still only ever talks to the mirror rather than needing its own egress to
-AWS. The cost is that ECR is not cached — which matters, because ECR Public
-rate-limits per source IP and a mirror concentrates a whole fleet onto one.
+Each registry also runs with:
+
+- `REGISTRY_PROXY_TTL=0`: cached content never expires. Expiry deletes the
+  manifest a cached tag points at, so an outage longer than the TTL would break
+  pulls of cached images.
+- `REGISTRY_PROXY_EXEC_COMMAND` pointing at an anonymous credential helper
+  (`registry-upstream-creds` in the stack directory). Without it the registry
+  probes its upstream at startup and panics if it is unreachable, so a restart
+  during an upstream outage would crash-loop. With it, the registry starts and
+  serves what it has cached.
+
+Anonymous ECR Public is rate limited per source IP, and the mirror concentrates a
+fleet onto one IP, so a burst of cold pulls can see `toomanyrequests`; cached
+images are unaffected.
 
 ### Redirects are passed through, not followed
 
@@ -174,10 +183,10 @@ certificate per host. Let's Encrypt allows 50 per registered domain per week,
 and a three-host fleet already issues 8 per host. Adding registries in bulk, or
 rebuilding the fleet from empty afterwards, can exhaust that.
 
-If the upstream turns out to serve manifests but 500 on blobs, it is refusing
-`registry:2`'s token handling — move it to `PASSTHROUGH_REGISTRIES` instead,
-which is what `public.ecr.aws` needs. A passthrough answers 401 on `/v2/` rather
-than 200, because the upstream's challenge reaches the client unaltered.
+Registries are anonymous. To authenticate to an upstream, give that registry its
+own credential helper that prints `{"Username":"…","Secret":"…"}` (see
+[GlueOps/registry](https://github.com/GlueOps/registry)); anyone who can reach the
+mirror can then pull whatever that account can.
 
 ### An APT suite
 

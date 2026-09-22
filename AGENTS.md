@@ -10,7 +10,7 @@ Two standalone installers. Neither imports the other; both generate a
 
 | Script | Builds | Status |
 | --- | --- | --- |
-| `install-mirror-stack.sh` | apt-cacher-ng + `registry:2` + Caddy | current |
+| `install-mirror-stack.sh` | apt-cacher-ng + `ghcr.io/glueops/registry` + Caddy | current |
 | `install.sh` | Sonatype Nexus + Caddy | legacy — under a usage meter from 15 Oct 2026 |
 
 There is no build system, no test suite and no dependency manifest. A change is
@@ -79,13 +79,18 @@ only the Caddyfile brings up nothing and leaves the old config serving. The
 script checksums both config files and reloads or restarts only what changed;
 keep that if you touch this area.
 
-**`registry:2` cannot proxy `public.ecr.aws`.** Distribution's pull-through
-proxy does not negotiate ECR Public's anonymous token. It serves manifests fine
-and answers 500 on every blob, so `/v2/` and a manifest check both report a
-healthy registry while nothing can be pulled. See
-[distribution#4383](https://github.com/distribution/distribution/issues/4383) —
-open, and it fails with credentials as well as without. ECR is in
-`PASSTHROUGH_REGISTRIES` for that reason. Do not "simplify" it back.
+**Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
+answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests
+work and every blob fails
+([distribution#4383](https://github.com/distribution/distribution/issues/4383)).
+That's why registries run `REGISTRY_IMAGE` (`ghcr.io/glueops/registry`, upstream
+plus that one fix). Don't switch back to a stock image until #4383 is fixed. Bump
+`REGISTRY_IMAGE` by tag *and* digest together, and prefer a `v*` release tag.
+
+**Keep `REGISTRY_PROXY_EXEC_COMMAND` and `REGISTRY_PROXY_TTL=0`.** Without a
+credential helper the registry probes its upstream at startup and panics if it is
+unreachable, so restarting during an upstream outage crash-loops. The helper must
+be executable. A non-zero TTL deletes cached manifests, even mid-outage.
 
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and

@@ -105,6 +105,35 @@ apt routes keep their headers; those backends are yours.
 Existing `registry:2` caches are reused as-is: the on-disk layout is the same, and
 they're served offline after the switch (tested).
 
+### Docker Hub official images
+
+Docker Hub keeps official images under `library/`, and the docker daemon adds
+that prefix only when talking to Hub **directly**. Through a mirror hostname it
+sends whatever you typed:
+
+```console
+$ docker pull <mirror>/nginx:trixie-perl
+Error response from daemon: manifest unknown
+
+$ docker pull <mirror>/library/nginx:trixie-perl   # works
+```
+
+Caddy rewrites the single-segment form for the hosts in `OFFICIAL_NAMESPACE`.
+The pattern requires the segment after the repository name to be
+`manifests`/`blobs`/`tags`, which confines it: `/v2/grafana/grafana/manifests/…`
+has `grafana` followed by `grafana`, so a namespaced image is left alone, and
+`/v2/` and `/v2/_catalog` do not match.
+
+### Access logs
+
+`format json` with bounded rolling, not the console format. These are files
+nobody tails, and json is what makes "which repositories is this mirror actually
+serving, and how much" answerable.
+
+The roll limits matter: Caddy defaults to 100MiB × 10 per log and this stack
+writes several of them, so the default ceiling is gigabytes of logs on a host
+whose whole job is caching.
+
 ### Helm and raw go through nginx
 
 Caddy fronts everything and terminates TLS. Behind it, nginx does the three

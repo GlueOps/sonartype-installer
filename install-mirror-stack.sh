@@ -103,6 +103,21 @@ REGISTRIES=(
   "gcr:gcr:5006:https://gcr.io"
 )
 
+# subdomain:namespace -- where a registry keeps its single-segment "official"
+# images.
+#
+# Docker Hub keeps them under library/, and the docker daemon adds that prefix
+# only when it is talking to Hub directly. Through a mirror hostname it sends
+# whatever the user typed, so `docker pull <mirror>/nginx:trixie-perl` asks for
+# /v2/nginx and gets "manifest unknown" while /v2/library/nginx succeeds.
+#
+# A separate table rather than a field on REGISTRIES: the two change for
+# different reasons, and those records are colon separated while a URL contains
+# "://", so a field added after the upstream is handed a fragment of it.
+OFFICIAL_NAMESPACE=(
+  "dockerhub:library"
+)
+
 # Everything apt-cacher-ng answers for. The Remap table inside acng.conf is what
 # maps these onto upstreams; Caddy only needs to know the set, to route it.
 APT_REPOS=(
@@ -204,6 +219,33 @@ fi
 cfg_sum() { [[ -f "$1" ]] && sha256sum "$1" | cut -d" " -f1 || echo "absent"; }
 CADDY_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/Caddyfile")"
 ACNG_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/acng.conf")"
+
+# A host with no room left fails deep inside `docker build`, as "You don't have
+# enough free space in /var/cache/apt/archives/" buried in a layer log -- which
+# reads like a broken Dockerfile rather than a full disk. Check first and say so.
+# This runs before anything is written and long before Nexus is stopped, and it
+# matters more now that a registry cache only grows.
+if [[ "${DRY_RUN}" != "1" ]]; then
+  need_mb=2048
+  for path in "$(dirname "${STACK_DIR}")" /var/lib/docker; do
+    [[ -d "${path}" ]] || continue
+    free_mb="$(df -Pm "${path}" | awk 'NR==2 {print $4}')"
+    if [[ -n "${free_mb}" && "${free_mb}" -lt "${need_mb}" ]]; then
+      df -h "${path}" >&2
+      die "only ${free_mb}MB free on ${path}, need at least ${need_mb}MB.
+
+Building the images alone needs a few hundred MB, and a registry cache only
+grows. Nothing has been changed and the current stack is still serving.
+
+To reclaim space:
+  docker system prune -af                 # unused images and layers
+  du -sh /opt/* /var/lib/docker/* 2>/dev/null | sort -h | tail
+On a host already migrated, the stopped Nexus stack is usually the largest
+thing on disk and is safe to remove once the new stack has proven itself:
+  rm -rf /opt/nexus ${OLD_STACK_DIR}"
+    fi
+  done
+fi
 
 log "Preparing ${STACK_DIR}"
 mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-cache,apt-log,registries,content-cache,content-log}
@@ -500,6 +542,23 @@ log "Writing landing page"
 regional_host() { local sub="${1:-}"; [[ -n "${sub}" ]] && echo "${sub}.${BASE_DOMAIN}" || echo "${BASE_DOMAIN}"; }
 global_host()   { local sub="${1:-}"; [[ -n "${sub}" ]] && echo "${sub}.${GLOBAL_BASE_DOMAIN}" || echo "${GLOBAL_BASE_DOMAIN}"; }
 
+official_ns_for() {
+  local want="$1" e
+  for e in "${OFFICIAL_NAMESPACE[@]}"; do
+    [[ "${e%%:*}" == "${want}" ]] && { echo "${e#*:}"; return 0; }
+  done
+  return 0
+}
+
+# The pattern requires the segment after the repository name to be one of
+# manifests/blobs/tags, which is what confines it to single-segment names:
+# /v2/grafana/grafana/manifests/x has `grafana` followed by `grafana`, so a
+# namespaced image is left alone, and /v2/ and /v2/_catalog do not match either.
+official_rewrite() {
+  echo "  @official path_regexp official ^/v2/([^/]+)/(manifests|blobs|tags)/(.*)\$"
+  echo "  rewrite @official /v2/$1/{re.official.1}/{re.official.2}/{re.official.3}"
+}
+
 # Build the apt route matcher from the table above, so the Caddyfile and the
 # Remap table cannot drift apart silently.
 apt_alternation="$(IFS='|'; echo "${APT_REPOS[*]}")"
@@ -521,6 +580,27 @@ log "Writing Caddyfile"
   fi
   # Registry traffic: long timeouts and no response buffering, because a layer
   # pull is a single large streamed body.
+  # Structured logs, with a bounded footprint.
+  #
+  # The console format is for a terminal; these are files nobody tails. json is
+  # what makes "which repositories is this mirror actually serving, and how
+  # much" a question something can answer.
+  #
+  # The roll limits are not decoration. Caddy defaults to 100MiB x 10 per log,
+  # and this stack writes several of them, so the default ceiling is gigabytes
+  # of logs on a host whose whole job is caching. One mirror has already filled
+  # its disk once.
+  echo "(accesslog) {"
+  echo "  log {"
+  echo "    output file /data/logs/{args[0]}-access.log {"
+  echo "      roll_size 32MiB"
+  echo "      roll_keep 4"
+  echo "      roll_keep_for 336h"
+  echo "    }"
+  echo "    format json"
+  echo "  }"
+  echo "}"
+  echo
   echo "(registry_proxy) {"
   echo "  reverse_proxy {args[0]} {"
   echo "    header_up Host {host}"
@@ -600,10 +680,7 @@ log "Writing Caddyfile"
   echo "    file_server"
   echo "  }"
   echo
-  echo "  log {"
-  echo "    output file /data/logs/mirror-access.log"
-  echo "    format console"
-  echo "  }"
+  echo "  import accesslog mirror"
   echo "}"
   echo
 
@@ -624,21 +701,17 @@ log "Writing Caddyfile"
   for entry in "${REGISTRIES[@]}"; do
     IFS=: read -r name sub _ _ <<<"${entry}"
     echo "$(regional_host "${sub}") {"
+    ns="$(official_ns_for "${sub}")"; [[ -n "${ns}" ]] && official_rewrite "${ns}"
     echo "  import registry_proxy registry-${name}:5000"
-    echo "  log {"
-    echo "    output file /data/logs/${name}-access.log"
-    echo "    format console"
-    echo "  }"
+    echo "  import accesslog ${name}"
     echo "}"
     echo
     if [[ -n "${GLOBAL_BASE_DOMAIN}" ]]; then
       echo "$(global_host "${sub}") {"
       echo "  import globalcert"
+      ns="$(official_ns_for "${sub}")"; [[ -n "${ns}" ]] && official_rewrite "${ns}"
       echo "  import registry_proxy registry-${name}:5000"
-      echo "  log {"
-      echo "    output file /data/logs/${name}-access.log"
-      echo "    format console"
-      echo "  }"
+      echo "  import accesslog ${name}"
       echo "}"
       echo
     fi

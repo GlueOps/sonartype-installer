@@ -46,12 +46,17 @@
 #                       GLOBAL_BASE_DOMAIN.
 #   STACK_DIR           default /opt/mirror-stack
 #   OLD_STACK_DIR       default /opt/nexus-stack
+#   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
+#   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
+#   LOG_MAX_FILES       rotated log files kept per container, default 5
 #   DRY_RUN=1           generate the config files and stop
 set -euo pipefail
 
 STACK_DIR="${STACK_DIR:-/opt/mirror-stack}"
 OLD_STACK_DIR="${OLD_STACK_DIR:-/opt/nexus-stack}"
 DRY_RUN="${DRY_RUN:-0}"
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-50m}"
+LOG_MAX_FILES="${LOG_MAX_FILES:-5}"
 
 GLOBAL_BASE_DOMAIN="${GLOBAL_BASE_DOMAIN:-}"
 GLOBAL_CERT_NAME="${GLOBAL_CERT_NAME:-${GLOBAL_BASE_DOMAIN}}"
@@ -196,6 +201,11 @@ done
 
 if [[ "${DRY_RUN}" != "1" ]]; then
   chown -R "${ACNG_UID}:${ACNG_UID}" "${STACK_DIR}/apt-cache" "${STACK_DIR}/apt-log"
+
+  # registry:2 left expiry state behind. With REGISTRY_PROXY_TTL=0 it's ignored, but
+  # every entry is long past due, so setting a TTL later would purge the whole cache
+  # at once. Remove it.
+  rm -f "${STACK_DIR}"/registries/*/scheduler-state.json
 
   if [[ -n "${CERT_SRC}" && "${CERT_SRC}" != "${STACK_DIR}/certs" ]]; then
     log "Carrying TLS state across from ${OLD_STACK_DIR}"
@@ -501,12 +511,21 @@ chmod 0755 "${STACK_DIR}/registry-upstream-creds"
 # Compose
 # ---------------------------------------------------------------------------
 log "Writing docker-compose.yml"
+# Docker's json-file logs grow without limit unless capped.
+compose_logging() {
+  echo "    logging:"
+  echo "      driver: json-file"
+  echo "      options:"
+  echo "        max-size: \"${LOG_MAX_SIZE}\""
+  echo "        max-file: \"${LOG_MAX_FILES}\""
+}
 {
   echo "services:"
   echo "  caddy:"
   echo "    image: caddy:2"
   echo "    container_name: mirror-caddy"
   echo "    restart: unless-stopped"
+  compose_logging
   echo "    ports:"
   echo "      - \"80:80\""
   echo "      - \"443:443\""
@@ -525,6 +544,7 @@ log "Writing docker-compose.yml"
   echo "      dockerfile: Dockerfile.acng"
   echo "    container_name: apt-cache"
   echo "    restart: unless-stopped"
+  compose_logging
   echo "    volumes:"
   echo "      - ${STACK_DIR}/acng.conf:/etc/apt-cacher-ng/acng.conf:ro"
   echo "      - ${STACK_DIR}/apt-cache:/var/cache/apt-cacher-ng"
@@ -543,19 +563,21 @@ log "Writing docker-compose.yml"
     echo "    image: ${REGISTRY_IMAGE}"
     echo "    container_name: registry-${name}"
     echo "    restart: unless-stopped"
+    compose_logging
     echo "    environment:"
-    echo "      # Upstream docs are explicit that a pull-through cache uses the"
-    echo "      # filesystem driver: it is the only one they guarantee correct here."
+    echo "      # Filesystem: the only storage upstream guarantees for a pull-through cache."
     echo "      - REGISTRY_PROXY_REMOTEURL=${up}"
     echo "      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry"
     echo "      - REGISTRY_HTTP_ADDR=0.0.0.0:5000"
-    echo "      # Never expire cached content. Expiry deletes the manifest a cached tag"
-    echo "      # points at, so an outage longer than the TTL would break cached pulls."
+    echo "      # Never expire: expiry deletes cached manifests, even during an outage."
     echo "      - REGISTRY_PROXY_TTL=0"
-    echo "      # A credential helper instead of no credentials: without it the registry"
-    echo "      # probes the upstream at startup and panics if it is unreachable, so a"
-    echo "      # restart during an upstream outage would crash-loop."
+    echo "      # Skips the startup probe of the upstream, which panics when it's unreachable."
     echo "      - REGISTRY_PROXY_EXEC_COMMAND=/etc/distribution/registry-upstream-creds"
+    echo "      # The image's default config is registry:3's development one: debug"
+    echo "      # logging, and a debug/pprof server reachable from other containers."
+    echo "      - REGISTRY_LOG_LEVEL=info"
+    echo "      - REGISTRY_LOG_FIELDS_ENVIRONMENT=production"
+    echo "      - REGISTRY_HTTP_DEBUG_ADDR=127.0.0.1:5001"
     echo "    volumes:"
     echo "      - ${STACK_DIR}/registries/${name}:/var/lib/registry"
     echo "      - ${STACK_DIR}/registry-upstream-creds:/etc/distribution/registry-upstream-creds:ro"
@@ -589,8 +611,8 @@ fi
 log "Starting the mirror stack"
 cd "${STACK_DIR}"
 # --remove-orphans clears containers this compose file no longer declares, such
-# as a registry that has moved to a Caddy passthrough. Left behind, it keeps
-# running and answering, which makes a stale route look healthy.
+# as a registry removed from REGISTRIES. Left behind, it keeps running and
+# answering, which makes a stale route look healthy.
 docker compose up -d --remove-orphans
 
 # Now apply the config changes compose cannot see.

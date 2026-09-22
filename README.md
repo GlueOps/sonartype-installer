@@ -105,131 +105,42 @@ apt routes keep their headers; those backends are yours.
 Existing `registry:2` caches are reused as-is: the on-disk layout is the same, and
 they're served offline after the switch (tested).
 
-### Redirects are passed through, not followed
+### Helm and raw go through nginx
 
-Nexus followed upstream redirects server-side, so a client only ever talked to
-the mirror. Caddy hands the 302 back instead. Three paths do this: `raw-github`
-release assets, `raw-pkgs-k8s/…/Release.key`, and `raw-buildkite-helm/gpgkey`.
+Caddy fronts everything and terminates TLS. Behind it, nginx does the three
+things Caddy cannot: keep a copy, serve that copy when the upstream is
+unreachable, and rewrite a response body.
 
-Rewriting `Location` back through the mirror was tried and removed. GitHub has
-already moved release assets from `objects.githubusercontent.com` to
-`release-assets.githubusercontent.com`, so a hardcoded CDN list is stale on
-arrival and silently becomes a no-op; buildkite hands out a CloudFront URL whose
-signature covers the exact URL and expires. A rewrite table that is wrong fails
-closed on a path that would otherwise have worked.
+**Chart URLs are rewritten.** A Helm `index.yaml` carries absolute download
+URLs — 219 pointing at `github.com` across tigera, metrics-server and
+containeroo, and 11,652 at `charts.helm.sh` in the archived helm-stable. Nexus
+rewrote them to itself; Caddy could not, so `helm install` fetched the index
+from the mirror and the chart from GitHub. nginx rewrites them with
+`sub_filter`.
 
-The consequence is an egress one: those three fetches need the client to reach
-the CDN. Nothing else is lost — no raw repository was caching anything anyway.
+Note `proxy_set_header Accept-Encoding "";` on those locations. Every one of
+those indexes serves gzip when asked, and **`sub_filter` cannot touch a
+compressed body** — without it the rewrite silently does nothing at all.
 
-## Adding a repository
+**Redirects are followed server-side.** `github.com`, `pkgs.k8s.io` and
+`packages.buildkite.com` all answer a download with a 302 to a CDN. Handing that
+back means the client needs its own egress, nothing is cached, and an outage is
+a hard failure. nginx follows them with `proxy_intercept_errors` and a named
+location. The cache key stays the **original request path**: buildkite's
+CloudFront URLs are signed and expiring, and GitHub's asset CDN hostname has
+already changed once, so keying on the target would never hit.
 
-Every kind of upstream lives in one table near the top of
-`install-mirror-stack.sh`. Add a line, re-run the installer, done — it is
-idempotent and reloads only what changed.
+**Stale is served on error.** `proxy_cache_use_stale error timeout updating
+http_5xx` is the point of the whole component. Verified: with an entry's TTL
+expired and the upstream resolving to an unroutable address, a cached path
+returns 200 from disk while a path that was never cached returns 504.
 
-**The name you choose becomes a URL.** Clients fetch
-`https://<host>/repository/<name>/…`, so a rename is a breaking change for every
-`sources.list` and `helm repo add` pointing at it. Pick it once.
-
-### A Helm chart repository
-
-`HELM_REPOS`, as `name:upstream host:upstream path prefix`:
-
-```bash
-"helm-cilium:helm.cilium.io:"
-```
-
-Served at `/repository/helm-cilium/`, proxied to `https://helm.cilium.io/`.
-Leave the third field empty when the charts sit at the host root.
-
-### A raw HTTP proxy
-
-`RAW_REPOS`, same shape:
-
-```bash
-"raw-cni-plugins:github.com:/containernetworking/plugins/releases/download"
-```
-
-Raw proxies always revalidate against the upstream — there is no local copy to
-go stale — so this is the right table for anything whose content moves under a
-stable path.
-
-If the upstream answers with a redirect to a CDN, the client follows it itself;
-see *Redirects are passed through, not followed* above. That is a deliberate
-choice, not an oversight.
-
-### A container registry
-
-One line, and some DNS.
-
-`REGISTRIES`, as `name:subdomain:host port:upstream`:
-
-```bash
-"mcr:mcr:5007:https://mcr.microsoft.com"
-```
-
-Then, **before deploying**:
-
-1. Create the DNS record for `<subdomain>.<BASE_DOMAIN>` — and for
-   `<subdomain>.<GLOBAL_BASE_DOMAIN>` if you run a global hostname.
-2. Pick an unused host port. The existing ones run 5000–5006.
-
-Each registry gets its own hostname because the Docker registry protocol has no
-way to select a backend from the path — the hostname is the only routing signal
-a `docker pull` sends.
-
-**Mind the certificate budget.** A new subdomain means a new regional ACME
-certificate per host. Let's Encrypt allows 50 per registered domain per week,
-and a three-host fleet already issues 8 per host. Adding registries in bulk, or
-rebuilding the fleet from empty afterwards, can exhaust that.
-
-Registries pull anonymously, through one shared helper that the script rewrites on
-every run. To authenticate to an upstream you have to edit the script: mount a
-per-registry helper that prints `{"Username":"…","Secret":"…"}`, and for expiring
-tokens (e.g. ECR, 12h) set `REGISTRY_PROXY_EXEC_LIFETIME`, or the first token is
-cached until the container restarts. Anyone who can reach the mirror can then pull
-whatever that account can.
-
-### An APT suite
-
-Two places, and the second one decides how much disk you use.
-
-First, `APT_REPOS` — this is only the routing list, so Caddy knows to send that
-prefix to apt-cacher-ng:
-
-```bash
-ubuntu-questing ubuntu-questing-updates ubuntu-questing-security
-```
-
-Second, a `Remap` line in the `acng.conf` heredoc. **Several local prefixes on
-one `Remap` share a single cache tree**, and that is the whole decision:
-
-```
-Remap-<name>: /repository/<a> /repository/<b> ; https://upstream/path
-```
-
-- **Merge** suites that differ only by the suite name in the path and share an
-  identical `pool/`. The nine `ubuntu-*` repositories are one `Remap` for
-  exactly this reason — separate trees would store every `.deb` nine times.
-- **Do not merge** archives that are genuinely separate.
-  `security.debian.org` has its own `pool/`, so it gets its own `Remap` even
-  though it is also Debian.
-- **Flat repositories** — `pkgs.k8s.io` publishes each Kubernetes minor as an
-  independent tree with nothing to share — get one `Remap` each.
-
-An upstream reachable only over HTTPS is fine as a target; remapping a plain
-client-facing path onto an HTTPS upstream is the documented way to cache one.
-
-After adding, confirm the suite actually resolves:
-
-```bash
-curl -sI https://<host>/repository/<name>/dists/<suite>/InRelease
-```
-
-A 404 there usually means the upstream does not carry that suite yet — Docker
-publishes no suite for an Ubuntu release on the day it ships — rather than that
-the `Remap` is wrong.
-
+Two settings that are not optional. `proxy_buffer_size 32k` — GitHub's 302
+carries a signed URL long enough that the default 4k buffer fails the request as
+`upstream sent too big header`. And `proxy_max_temp_file_size` must **not** be
+0: nginx writes a response to a temp file on its way into the cache, so
+disabling that silently stops anything larger than the buffers from ever being
+cached.
 
 ## `install.sh` (Nexus)
 

@@ -63,6 +63,9 @@ GLOBAL_CERT_NAME="${GLOBAL_CERT_NAME:-${GLOBAL_BASE_DOMAIN}}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 
 ACNG_UID="${ACNG_UID:-8142}"
+# The helm and raw cache. Charts and release binaries are small next to
+# container layers; this is a ceiling, not an allocation.
+NGINX_CACHE_MAX_SIZE="${NGINX_CACHE_MAX_SIZE:-20g}"
 
 # Upstream Distribution 3.1.1 plus one fix so it can proxy public.ecr.aws, which
 # stock registry:2/registry:3 cannot (distribution#4383): ECR Public answers HEAD
@@ -137,26 +140,37 @@ RAW_REPOS=(
   "raw-github:github.com:"
 )
 
-# REDIRECTS ARE PASSED THROUGH, NOT FOLLOWED
-# Nexus followed an upstream redirect server-side, so a client only ever talked
-# to the mirror. Caddy does not follow them: it hands the 302 back and the client
-# fetches the CDN itself. Three paths do this -- raw-github release assets,
-# raw-pkgs-k8s Release.key, raw-buildkite-helm gpgkey.
+# external-prefix|local-route -- where a Helm index.yaml points, and where it
+# should point instead.
 #
-# Rewriting the Location header back through the mirror was tried and removed.
-# It cannot be made to hold:
-#   - GitHub has already moved release assets from objects.githubusercontent.com
-#     to release-assets.githubusercontent.com, so the hostname install.sh
-#     documents is stale and a hardcoded list silently becomes a no-op.
-#   - buildkite hands out a CloudFront URL whose signature covers the exact URL
-#     and expires, on an opaque hostname free to change.
-# A rewrite table that is wrong is worse than no rewrite table: it fails closed
-# on a path that would otherwise have worked.
+# A chart index carries absolute download URLs. Nexus rewrote them to itself;
+# Caddy cannot rewrite a response body at all, so until now `helm install`
+# fetched the index from the mirror and the chart from GitHub. nginx does the
+# rewrite, and the route it rewrites to has to be one that can serve the thing --
+# which is why following redirects server-side is part of the same job rather
+# than a separate nicety.
 #
-# The practical consequence is an egress one. These three fetches -- all of them
-# small, all of them once per node bootstrap except github release assets -- need
-# the client to reach the CDN. None of the raw repositories cached anything under
-# Nexus either (they all ran contentMaxAge=0), so nothing else is lost.
+# Verified against the live indexes: 219 chart URLs across tigera,
+# metrics-server and containeroo point at github.com, and 11652 in the archived
+# helm-stable point at charts.helm.sh.
+#
+# Pipe separated, because both halves contain colons.
+CHART_URL_REWRITES=(
+  "https://github.com/|/repository/raw-github/"
+  "https://charts.helm.sh/stable/|/repository/helm-stable/"
+)
+
+# REDIRECTS ARE FOLLOWED SERVER-SIDE BY NGINX
+# github.com answers a release download with a 302 to a CDN, pkgs.k8s.io and
+# packages.buildkite.com do the same. Handing that redirect back to the client
+# means the client needs egress to the CDN, nothing is cached, and an upstream
+# outage is a hard failure -- which is the opposite of what a mirror is for.
+#
+# nginx follows them with proxy_intercept_errors plus a named location that
+# proxies to $upstream_http_location. The cache key stays the ORIGINAL request
+# path, not the redirect target: buildkite's CloudFront URLs are signed and
+# expiring and GitHub's CDN hostname has already changed once, so keying on the
+# target would mean never getting a cache hit.
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -192,7 +206,7 @@ CADDY_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/Caddyfile")"
 ACNG_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/acng.conf")"
 
 log "Preparing ${STACK_DIR}"
-mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-cache,apt-log,registries}
+mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-cache,apt-log,registries,content-cache,content-log}
 mkdir -p "${STACK_DIR}/site"
 for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ _ _ <<<"${entry}"
@@ -295,6 +309,145 @@ Remap-dockerdebian: /repository/docker-debian-bookworm /repository/docker-debian
 # really is .../helm-debian/any/dists/any/. Preserved verbatim.
 Remap-helmapt: /repository/helm-apt ; https://packages.buildkite.com/helm-linux/helm-debian/any
 EOF
+
+
+# ---------------------------------------------------------------------------
+# nginx: the content cache for helm and raw
+# ---------------------------------------------------------------------------
+# Caddy fronts everything and terminates TLS; this sits behind it and does the
+# three things Caddy cannot: keep a copy, serve that copy when the upstream is
+# unreachable, and rewrite a response body.
+log "Writing nginx.conf"
+{
+  echo "worker_processes auto;"
+  echo "error_log /var/log/nginx/error.log warn;"
+  echo "events { worker_connections 2048; }"
+  echo "http {"
+  echo "  include /etc/nginx/mime.types;"
+  echo "  default_type application/octet-stream;"
+  echo "  sendfile on;"
+  echo "  server_tokens off;"
+  echo
+  echo "  # Cache status is the only thing worth logging here -- Caddy already"
+  echo "  # records the request. HIT/MISS/STALE is what says whether this is"
+  echo "  # earning its keep."
+  echo "  log_format cache '\$status \$upstream_cache_status \$body_bytes_sent \$request_uri';"
+  echo "  access_log /var/log/nginx/access.log cache;"
+  echo
+  echo "  # Docker's embedded DNS. Required because the redirect-following"
+  echo "  # location proxies to a hostname only known at request time."
+  echo "  resolver 127.0.0.11 ipv6=off valid=30s;"
+  echo "  resolver_timeout 5s;"
+  echo
+  echo "  proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=content:64m"
+  echo "                   max_size=${NGINX_CACHE_MAX_SIZE} inactive=365d use_temp_path=off;"
+  echo
+  echo "  # The original request path, never the redirect target. buildkite hands"
+  echo "  # out signed expiring CloudFront URLs and GitHub's asset CDN hostname has"
+  echo "  # already changed once; keying on either would never hit."
+  echo "  proxy_cache_key \"\$host\$request_uri\";"
+  echo "  proxy_cache_lock on;"
+  echo "  proxy_cache_lock_timeout 60s;"
+  echo "  proxy_cache_background_update on;"
+  echo "  proxy_cache_revalidate on;"
+  echo
+  echo "  # The outage behaviour this whole component exists for: if the upstream"
+  echo "  # errors, times out or 5xxes, serve what we already have."
+  echo "  proxy_cache_use_stale error timeout updating"
+  echo "                        http_500 http_502 http_503 http_504 http_429;"
+  echo
+  echo "  proxy_ssl_server_name on;"
+  echo "  proxy_ssl_protocols TLSv1.2 TLSv1.3;"
+  echo "  proxy_http_version 1.1;"
+  echo "  proxy_connect_timeout 15s;"
+  echo "  proxy_read_timeout 300s;"
+  echo "  proxy_send_timeout 300s;"
+  echo "  proxy_buffering on;"
+  echo "  # GitHub's 302 to its asset CDN carries a signed URL hundreds of bytes"
+  echo "  # long, and the default 4k header buffer cannot hold the response."
+  echo "  # Without this every redirect-following fetch fails as 502 \"upstream"
+  echo "  # sent too big header\"."
+  echo "  proxy_buffer_size 32k;"
+  echo "  proxy_buffers 8 32k;"
+  echo "  proxy_busy_buffers_size 64k;"
+  echo "  # Deliberately NOT proxy_max_temp_file_size 0: nginx writes a response"
+  echo "  # to a temp file on its way into the cache, so disabling that silently"
+  echo "  # stops anything larger than the buffers from ever being cached."
+  echo "  proxy_max_temp_file_size 2048m;"
+  echo
+  echo "  # These are third-party origins fetched as an ordinary client, which is"
+  echo "  # what Nexus did. packages.buildkite.com answers any request carrying an"
+  echo "  # X-Forwarded-Proto with a 301 to its marketing site."
+  echo "  proxy_set_header X-Forwarded-For \"\";"
+  echo "  proxy_set_header X-Forwarded-Proto \"\";"
+  echo "  proxy_set_header X-Forwarded-Host \"\";"
+  echo
+  echo "  server {"
+  echo "    listen 8080;"
+  echo "    server_name _;"
+  echo
+  echo "    location = /healthz { return 200 \"ok\\n\"; }"
+  echo
+
+  # ---- helm: cache, and rewrite the chart URLs in index.yaml ----
+  for entry in "${HELM_REPOS[@]}"; do
+    IFS=: read -r name host path <<<"${entry}"
+    echo "    location /repository/${name}/ {"
+    echo "      proxy_pass https://${host}${path}/;"
+    echo "      proxy_set_header Host ${host};"
+    echo "      proxy_cache content;"
+    echo "      # An index moves; a chart tarball at a version does not."
+    echo "      proxy_cache_valid 200 206 5m;"
+    echo "      proxy_intercept_errors on;"
+    echo "      error_page 301 302 303 307 308 = @follow_redirect;"
+    echo
+    echo "      # sub_filter cannot touch a compressed body, and every one of"
+    echo "      # these indexes serves gzip when asked. Without this the rewrite"
+    echo "      # silently does nothing at all."
+    echo "      proxy_set_header Accept-Encoding \"\";"
+    echo "      sub_filter_once off;"
+    echo "      sub_filter_types text/yaml application/x-yaml application/yaml text/plain;"
+    for rw in "${CHART_URL_REWRITES[@]}"; do
+      ext="${rw%%|*}"; loc="${rw#*|}"
+      echo "      sub_filter '${ext}' 'https://\$host${loc}';"
+    done
+    echo "      gzip on;"
+    echo "      gzip_types text/yaml application/x-yaml application/yaml text/plain;"
+    echo "    }"
+    echo
+  done
+
+  # ---- raw: cache, and follow redirects rather than handing them back ----
+  for entry in "${RAW_REPOS[@]}"; do
+    IFS=: read -r name host path <<<"${entry}"
+    echo "    location /repository/${name}/ {"
+    echo "      proxy_pass https://${host}${path}/;"
+    echo "      proxy_set_header Host ${host};"
+    echo "      proxy_cache content;"
+    echo "      proxy_cache_valid 200 206 30d;"
+    echo "      proxy_intercept_errors on;"
+    echo "      error_page 301 302 303 307 308 = @follow_redirect;"
+    echo "    }"
+    echo
+  done
+
+  echo "    # Shared by every location above. \$upstream_http_location is the"
+  echo "    # Location header of the response we just intercepted; the cache key"
+  echo "    # set at http level keeps this stored under the original path."
+  echo "    location @follow_redirect {"
+  echo "      internal;"
+  echo "      set \$redirect_target \$upstream_http_location;"
+  echo "      proxy_pass \$redirect_target;"
+  echo "      proxy_set_header Host \"\";"
+  echo "      proxy_set_header Authorization \"\";"
+  echo "      proxy_cache content;"
+  echo "      proxy_cache_valid 200 206 30d;"
+  echo "      # One hop only. A redirect loop must fail, not recurse."
+  echo "      proxy_intercept_errors off;"
+  echo "    }"
+  echo "  }"
+  echo "}"
+} > "${STACK_DIR}/nginx.conf"
 
 # ---------------------------------------------------------------------------
 # Landing page. The Nexus UI is gone and nothing replaces it, so the bare
@@ -418,30 +571,28 @@ log "Writing Caddyfile"
     echo "      header_up -X-Forwarded-Host"
   }
 
-  echo "  # ---- Helm chart repositories ----"
-  for entry in "${HELM_REPOS[@]}"; do
-    IFS=: read -r name host path <<<"${entry}"
-    echo "  handle_path /repository/${name}/* {"
-    [[ -n "${path}" ]] && echo "    rewrite * ${path}{uri}"
-    echo "    reverse_proxy https://${host} {"
-    echo "      header_up Host ${host}"
-    strip_forwarded
-    echo "    }"
-    echo "  }"
-  done
-  echo
+  # Helm and raw both go to nginx, which caches them, serves what it has when
+  # the upstream is unreachable, rewrites chart URLs and follows redirects.
+  # Caddy keeps only the routing decision; the per-repository table lives in
+  # nginx.conf so the two cannot disagree about it.
+  content_names=()
+  for entry in "${HELM_REPOS[@]}" "${RAW_REPOS[@]}"; do content_names+=("${entry%%:*}"); done
+  content_alternation="$(IFS='|'; echo "${content_names[*]}")"
 
-  echo "  # ---- Raw HTTP proxies ----"
-  for entry in "${RAW_REPOS[@]}"; do
-    IFS=: read -r name host path <<<"${entry}"
-    echo "  handle_path /repository/${name}/* {"
-    [[ -n "${path}" ]] && echo "    rewrite * ${path}{uri}"
-    echo "    reverse_proxy https://${host} {"
-    echo "      header_up Host ${host}"
-    strip_forwarded
-    echo "    }"
-    echo "  }"
-  done
+  echo "  # ---- Helm chart repositories and raw HTTP proxies ----"
+  echo "  @content path_regexp ^/repository/(${content_alternation})(/|\$)"
+  echo "  handle @content {"
+  echo "    reverse_proxy content-cache:8080 {"
+  echo "      header_up Host {host}"
+  echo "      flush_interval -1"
+  echo "      transport http {"
+  echo "        dial_timeout 15s"
+  echo "        response_header_timeout 300s"
+  echo "        read_timeout 0"
+  echo "        write_timeout 0"
+  echo "      }"
+  echo "    }"
+  echo "  }"
   echo
 
   echo "  handle {"
@@ -537,6 +688,22 @@ compose_logging() {
   echo "      - ${STACK_DIR}/certs:/certs:ro"
   echo "    depends_on:"
   echo "      - apt-cache"
+  echo "      - content-cache"
+  echo
+  echo "  content-cache:"
+  echo "    image: nginx:alpine"
+  echo "    container_name: content-cache"
+  echo "    restart: unless-stopped"
+  echo "    volumes:"
+  echo "      - ${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro"
+  echo "      - ${STACK_DIR}/content-cache:/var/cache/nginx"
+  echo "      - ${STACK_DIR}/content-log:/var/log/nginx"
+  echo "    healthcheck:"
+  echo "      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1\"]"
+  echo "      interval: 30s"
+  echo "      timeout: 5s"
+  echo "      retries: 3"
+  echo "      start_period: 10s"
   echo
   echo "  apt-cache:"
   echo "    build:"
@@ -697,6 +864,19 @@ check "apt  debian-trixie" '^200$' "https://${BASE_DOMAIN}/repository/debian-tri
 check "apt  kubernetes-v1-34" '^200$' "https://${BASE_DOMAIN}/repository/kubernetes-v1-34/Release"
 check "helm helm-tigera" '^200$' "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"
 check "helm helm-metrics-server" '^200$' "https://${BASE_DOMAIN}/repository/helm-metrics-server/index.yaml"
+# The chart URLs in an index must point back here, not at GitHub. A Helm client
+# reads this field and downloads from whatever it says, so if the rewrite stops
+# working every `helm install` silently leaves the mirror again.
+check "helm index rewritten" '^200$' \
+  "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"
+if curl -fsS --max-time 60 "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml" 2>/dev/null \
+     | grep -qE "^\s+- https://${BASE_DOMAIN}/repository/"; then
+  printf '  ok    %-30s chart urls point here\n' "helm url rewrite"
+else
+  printf '  FAIL  %-30s chart urls still point upstream\n' "helm url rewrite"
+  failed=$((failed + 1))
+fi
+
 check "raw  raw-docker gpg" '^200$' "https://${BASE_DOMAIN}/repository/raw-docker/linux/ubuntu/gpg"
 check "raw  raw-k8s" '^200$' "https://${BASE_DOMAIN}/repository/raw-k8s/release/stable.txt"
 check "raw  raw-helm checksum" '^200$' "https://${BASE_DOMAIN}/repository/raw-helm/helm-v3.16.0-linux-amd64.tar.gz.sha256sum"

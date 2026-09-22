@@ -81,29 +81,29 @@ apt routes keep their headers; those backends are yours.
 
 ### Registries run `ghcr.io/glueops/registry`
 
-Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`: ECR Public answers
-`HEAD` on a blob with 401, and Distribution's pull-through proxy HEADs every blob
-before fetching it, so every uncached pull fails
-([distribution#4383](https://github.com/distribution/distribution/issues/4383)).
-[`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) is upstream
-Distribution 3.1.1 with only that fixed, so `ecr.` is cached like every other
-registry and clients only ever talk to the mirror. It is pinned by digest in
-`REGISTRY_IMAGE`.
+[`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) is Distribution
+3.1.1 plus one fix for ECR Public
+([distribution#4383](https://github.com/distribution/distribution/issues/4383)), so
+`ecr.` is cached like the other registries. It's pinned in `REGISTRY_IMAGE`.
 
-Each registry also runs with:
+- **Egress**: ECR redirects blobs to CloudFront; the registry follows that itself,
+  so only the mirror host needs to reach CloudFront.
+- **Rate limits**: anonymous ECR Public throttles per source IP, and each uncached
+  blob costs about 3 requests to ECR. A burst of cold pulls can hit
+  `toomanyrequests`; cached images are unaffected.
+- **`REGISTRY_PROXY_TTL=0`**: nothing is evicted, so `registries/` only grows.
+  That's today's behaviour too (`registry:2` has deletes disabled, so its expiry
+  never removed anything); the new image would actually delete, including during an
+  outage. To reclaim space for one registry: stop `registry-<name>`, delete
+  `registries/<name>`, start it again. It refills on demand.
+- **`REGISTRY_PROXY_EXEC_COMMAND`**: an anonymous credential helper. Without one the
+  registry panics at startup when its upstream is unreachable, so a restart during
+  an outage would crash-loop.
+- Logging is `info` and container logs are capped (`LOG_MAX_SIZE` × `LOG_MAX_FILES`,
+  default 50m × 5 per container).
 
-- `REGISTRY_PROXY_TTL=0`: cached content never expires. Expiry deletes the
-  manifest a cached tag points at, so an outage longer than the TTL would break
-  pulls of cached images.
-- `REGISTRY_PROXY_EXEC_COMMAND` pointing at an anonymous credential helper
-  (`registry-upstream-creds` in the stack directory). Without it the registry
-  probes its upstream at startup and panics if it is unreachable, so a restart
-  during an upstream outage would crash-loop. With it, the registry starts and
-  serves what it has cached.
-
-Anonymous ECR Public is rate limited per source IP, and the mirror concentrates a
-fleet onto one IP, so a burst of cold pulls can see `toomanyrequests`; cached
-images are unaffected.
+Existing `registry:2` caches are reused as-is: the on-disk layout is the same, and
+they're served offline after the switch (tested).
 
 ### Redirects are passed through, not followed
 
@@ -160,12 +160,12 @@ choice, not an oversight.
 
 ### A container registry
 
-Two lines, and some DNS.
+One line, and some DNS.
 
 `REGISTRIES`, as `name:subdomain:host port:upstream`:
 
 ```bash
-"ecrpriv:ecrpriv:5007:https://123456789012.dkr.ecr.eu-west-1.amazonaws.com"
+"mcr:mcr:5007:https://mcr.microsoft.com"
 ```
 
 Then, **before deploying**:
@@ -183,10 +183,12 @@ certificate per host. Let's Encrypt allows 50 per registered domain per week,
 and a three-host fleet already issues 8 per host. Adding registries in bulk, or
 rebuilding the fleet from empty afterwards, can exhaust that.
 
-Registries are anonymous. To authenticate to an upstream, give that registry its
-own credential helper that prints `{"Username":"…","Secret":"…"}` (see
-[GlueOps/registry](https://github.com/GlueOps/registry)); anyone who can reach the
-mirror can then pull whatever that account can.
+Registries pull anonymously, through one shared helper that the script rewrites on
+every run. To authenticate to an upstream you have to edit the script: mount a
+per-registry helper that prints `{"Username":"…","Secret":"…"}`, and for expiring
+tokens (e.g. ECR, 12h) set `REGISTRY_PROXY_EXEC_LIFETIME`, or the first token is
+cached until the container restarts. Anyone who can reach the mirror can then pull
+whatever that account can.
 
 ### An APT suite
 

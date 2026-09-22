@@ -90,7 +90,14 @@ plus that one fix). Don't switch back to a stock image until #4383 is fixed. Bum
 **Keep `REGISTRY_PROXY_EXEC_COMMAND` and `REGISTRY_PROXY_TTL=0`.** Without a
 credential helper the registry probes its upstream at startup and panics if it is
 unreachable, so restarting during an upstream outage crash-loops. The helper must
-be executable. A non-zero TTL deletes cached manifests, even mid-outage.
+be executable, or the registry silently pulls anonymously. The image deletes on
+expiry (unlike `registry:2`), so a non-zero TTL removes cached manifests even
+mid-outage. The script deletes `registry:2`'s old `scheduler-state.json`, whose
+entries are all overdue.
+
+**The image's default config is registry:3's development one** (debug logging, a
+debug/pprof server on `:5001`). Keep the `REGISTRY_LOG_*` and
+`REGISTRY_HTTP_DEBUG_ADDR` overrides.
 
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and

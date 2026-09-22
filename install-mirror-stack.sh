@@ -16,8 +16,8 @@
 #
 # WHAT IT BUILDS
 #   27 apt suites       -> apt-cacher-ng, 12 Remap entries
-#    7 registries       -> 6 x registry:2 in pull-through mode, plus ECR proxied
-#                          directly by Caddy (see PASSTHROUGH_REGISTRIES)
+#    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
+#                          upstream (see REGISTRY_IMAGE)
 #    4 helm + 6 raw     -> Caddy reverse_proxy, straight to the upstream
 # No licence meter, no admin user, no EULA, no realm to switch on by hand.
 #
@@ -46,18 +46,29 @@
 #                       GLOBAL_BASE_DOMAIN.
 #   STACK_DIR           default /opt/mirror-stack
 #   OLD_STACK_DIR       default /opt/nexus-stack
+#   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
+#   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
+#   LOG_MAX_FILES       rotated log files kept per container, default 5
 #   DRY_RUN=1           generate the config files and stop
 set -euo pipefail
 
 STACK_DIR="${STACK_DIR:-/opt/mirror-stack}"
 OLD_STACK_DIR="${OLD_STACK_DIR:-/opt/nexus-stack}"
 DRY_RUN="${DRY_RUN:-0}"
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-50m}"
+LOG_MAX_FILES="${LOG_MAX_FILES:-5}"
 
 GLOBAL_BASE_DOMAIN="${GLOBAL_BASE_DOMAIN:-}"
 GLOBAL_CERT_NAME="${GLOBAL_CERT_NAME:-${GLOBAL_BASE_DOMAIN}}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 
 ACNG_UID="${ACNG_UID:-8142}"
+
+# Upstream Distribution 3.1.1 plus one fix so it can proxy public.ecr.aws, which
+# stock registry:2/registry:3 cannot (distribution#4383): ECR Public answers HEAD
+# on a blob with 401, and the proxy HEADs every blob before fetching it.
+# https://github.com/GlueOps/registry
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/glueops/registry:v0.0.2@sha256:8cb6fbe5b2e5b969c917026d3f323fcdfceb5d7dab2c1960e26bccd852ca0e82}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "==> $*"; }
@@ -77,38 +88,16 @@ fi
 # name is not free to change.
 # ---------------------------------------------------------------------------
 
-# name:subdomain:hostport:upstream -- each gets a registry:2 in pull-through mode.
+# name:subdomain:hostport:upstream -- each gets a REGISTRY_IMAGE container in
+# pull-through mode, caching on local disk.
 REGISTRIES=(
   "dockerhub:dockerhub:5000:https://registry-1.docker.io"
   "ghcr:ghcr:5001:https://ghcr.io"
   "quay:quay:5002:https://quay.io"
+  "ecr:ecr:5003:https://public.ecr.aws"
   "k8s:k8s:5004:https://registry.k8s.io"
   "gcp:gcp:5005:https://us-docker.pkg.dev"
   "gcr:gcr:5006:https://gcr.io"
-)
-
-# subdomain:upstream host -- proxied straight through by Caddy, with no
-# registry:2 in front and therefore no local cache.
-#
-# public.ecr.aws cannot be served by registry:2. Distribution's pull-through
-# proxy does not negotiate ECR Public's anonymous token: it serves manifests
-# fine and answers 500 on every blob, so /v2/ and a manifest check both call it
-# healthy while no image can actually be pulled. That is distribution#4383, open
-# since June 2024, and it fails with credentials supplied as well as without.
-# Reproduced on a clean registry:2 and on registry:3.
-#
-# A plain reverse_proxy works because the client does the token dance itself and
-# ECR accepts its own token. The 401 challenge's realm is rewritten to point
-# back here, and /token/ is proxied onward, so a client still only ever talks to
-# the mirror rather than needing its own egress to AWS.
-#
-# The cost is that ECR is not cached. That matters more here than it would
-# elsewhere, because ECR Public rate-limits per source IP and a mirror
-# concentrates the whole fleet onto one. Caching it needs an HTTP cache module
-# keyed on the immutable /v2/*/blobs/sha256:* paths, which is a follow-up; an
-# uncached ECR that works beats a cached one that cannot pull.
-PASSTHROUGH_REGISTRIES=(
-  "ecr:public.ecr.aws"
 )
 
 # Everything apt-cacher-ng answers for. The Remap table inside acng.conf is what
@@ -212,6 +201,11 @@ done
 
 if [[ "${DRY_RUN}" != "1" ]]; then
   chown -R "${ACNG_UID}:${ACNG_UID}" "${STACK_DIR}/apt-cache" "${STACK_DIR}/apt-log"
+
+  # registry:2 left expiry state behind. With REGISTRY_PROXY_TTL=0 it's ignored, but
+  # every entry is long past due, so setting a TTL later would purge the whole cache
+  # at once. Remove it.
+  rm -f "${STACK_DIR}"/registries/*/scheduler-state.json
 
   if [[ -n "${CERT_SRC}" && "${CERT_SRC}" != "${STACK_DIR}/certs" ]]; then
     log "Carrying TLS state across from ${OLD_STACK_DIR}"
@@ -317,10 +311,6 @@ log "Writing landing page"
   for entry in "${REGISTRIES[@]}"; do
     IFS=: read -r _ sub _ up <<<"${entry}"
     echo "<li><code>${sub}.${BASE_DOMAIN}</code> &rarr; ${up}</li>"
-  done
-  for entry in "${PASSTHROUGH_REGISTRIES[@]}"; do
-    IFS=: read -r sub up <<<"${entry}"
-    echo "<li><code>${sub}.${BASE_DOMAIN}</code> &rarr; https://${up} <em>(proxied, not cached)</em></li>"
   done
   echo "</ul><h2>APT (${#APT_REPOS[@]})</h2><ul>"
   for r in "${APT_REPOS[@]}"; do echo "<li><code>/repository/${r}/</code></li>"; done
@@ -503,62 +493,39 @@ log "Writing Caddyfile"
     fi
   done
 
-  # ---- registries Caddy proxies itself, with no registry:2 in front ----
-  for entry in "${PASSTHROUGH_REGISTRIES[@]}"; do
-    IFS=: read -r sub up <<<"${entry}"
-    for scope in regional global; do
-      if [[ "${scope}" == "regional" ]]; then
-        echo "$(regional_host "${sub}") {"
-      else
-        [[ -n "${GLOBAL_BASE_DOMAIN}" ]] || continue
-        echo "$(global_host "${sub}") {"
-        echo "  import globalcert"
-      fi
-      # The upstream advertises its own token endpoint in the 401 challenge.
-      # Left alone, a client would go straight to the upstream for a token and
-      # so need its own egress there. Rewriting the realm to point back here,
-      # and proxying /token/ onward, keeps the mirror the only host it talks to.
-      echo "  handle /token* {"
-      echo "    reverse_proxy https://${up} {"
-      echo "      header_up Host ${up}"
-      echo "    }"
-      echo "  }"
-      echo "  handle {"
-      echo "    reverse_proxy https://${up} {"
-      echo "      header_up Host ${up}"
-      echo "      header_up -X-Forwarded-For"
-      echo "      header_up -X-Forwarded-Proto"
-      echo "      header_up -X-Forwarded-Host"
-      echo "      header_down Www-Authenticate \"https://${up//./\\.}/token/\" \"https://{host}/token/\""
-      echo "      flush_interval -1"
-      echo "      transport http {"
-      echo "        dial_timeout 300s"
-      echo "        response_header_timeout 300s"
-      echo "        read_timeout 0"
-      echo "        write_timeout 0"
-      echo "      }"
-      echo "    }"
-      echo "  }"
-      echo "  log {"
-      echo "    output file /data/logs/${sub}-access.log"
-      echo "    format console"
-      echo "  }"
-      echo "}"
-      echo
-    done
-  done
 } > "${STACK_DIR}/Caddyfile"
+
+# ---------------------------------------------------------------------------
+# Registry credential helper (proxy.exec). Anonymous: prints empty credentials.
+# The registry runs it directly, so it must be executable.
+# ---------------------------------------------------------------------------
+log "Writing registry-upstream-creds"
+cat > "${STACK_DIR}/registry-upstream-creds" <<'EOF'
+#!/bin/sh
+cat >/dev/null
+echo '{"ServerURL":"","Username":"","Secret":""}'
+EOF
+chmod 0755 "${STACK_DIR}/registry-upstream-creds"
 
 # ---------------------------------------------------------------------------
 # Compose
 # ---------------------------------------------------------------------------
 log "Writing docker-compose.yml"
+# Docker's json-file logs grow without limit unless capped.
+compose_logging() {
+  echo "    logging:"
+  echo "      driver: json-file"
+  echo "      options:"
+  echo "        max-size: \"${LOG_MAX_SIZE}\""
+  echo "        max-file: \"${LOG_MAX_FILES}\""
+}
 {
   echo "services:"
   echo "  caddy:"
   echo "    image: caddy:2"
   echo "    container_name: mirror-caddy"
   echo "    restart: unless-stopped"
+  compose_logging
   echo "    ports:"
   echo "      - \"80:80\""
   echo "      - \"443:443\""
@@ -577,6 +544,7 @@ log "Writing docker-compose.yml"
   echo "      dockerfile: Dockerfile.acng"
   echo "    container_name: apt-cache"
   echo "    restart: unless-stopped"
+  compose_logging
   echo "    volumes:"
   echo "      - ${STACK_DIR}/acng.conf:/etc/apt-cacher-ng/acng.conf:ro"
   echo "      - ${STACK_DIR}/apt-cache:/var/cache/apt-cacher-ng"
@@ -592,17 +560,27 @@ log "Writing docker-compose.yml"
     IFS=: read -r name _ port up <<<"${entry}"
     echo
     echo "  registry-${name}:"
-    echo "    image: registry:2"
+    echo "    image: ${REGISTRY_IMAGE}"
     echo "    container_name: registry-${name}"
     echo "    restart: unless-stopped"
+    compose_logging
     echo "    environment:"
-    echo "      # Upstream docs are explicit that a pull-through cache uses the"
-    echo "      # filesystem driver: it is the only one they guarantee correct here."
+    echo "      # Filesystem: the only storage upstream guarantees for a pull-through cache."
     echo "      - REGISTRY_PROXY_REMOTEURL=${up}"
     echo "      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry"
     echo "      - REGISTRY_HTTP_ADDR=0.0.0.0:5000"
+    echo "      # Never expire: expiry deletes cached manifests, even during an outage."
+    echo "      - REGISTRY_PROXY_TTL=0"
+    echo "      # Skips the startup probe of the upstream, which panics when it's unreachable."
+    echo "      - REGISTRY_PROXY_EXEC_COMMAND=/etc/distribution/registry-upstream-creds"
+    echo "      # The image's default config is registry:3's development one: debug"
+    echo "      # logging, and a debug/pprof server reachable from other containers."
+    echo "      - REGISTRY_LOG_LEVEL=info"
+    echo "      - REGISTRY_LOG_FIELDS_ENVIRONMENT=production"
+    echo "      - REGISTRY_HTTP_DEBUG_ADDR=127.0.0.1:5001"
     echo "    volumes:"
     echo "      - ${STACK_DIR}/registries/${name}:/var/lib/registry"
+    echo "      - ${STACK_DIR}/registry-upstream-creds:/etc/distribution/registry-upstream-creds:ro"
     echo "    ports:"
     echo "      - \"127.0.0.1:${port}:5000\""
   done
@@ -633,8 +611,8 @@ fi
 log "Starting the mirror stack"
 cd "${STACK_DIR}"
 # --remove-orphans clears containers this compose file no longer declares, such
-# as a registry that has moved to a Caddy passthrough. Left behind, it keeps
-# running and answering, which makes a stale route look healthy.
+# as a registry removed from REGISTRIES. Left behind, it keeps running and
+# answering, which makes a stale route look healthy.
 docker compose up -d --remove-orphans
 
 # Now apply the config changes compose cannot see.
@@ -692,7 +670,7 @@ check(){ # label, expected-codes-regex, url, curl args...
   else printf '  FAIL  %-30s %s  (%s)\n' "${label}" "${code}" "${url}"; failed=$((failed + 1)); fi
 }
 
-# registry:2 binds its port a moment after the container reports started, so a
+# The registry binds its port a moment after the container reports started, so a
 # check that runs immediately races it. Waiting here rather than lengthening
 # every probe keeps a genuine failure fast to report.
 log "Waiting for the registries"
@@ -736,14 +714,6 @@ for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r _ sub _ _ <<<"${entry}"
   check "registry ${sub} TLS" '^(200|401)$' "https://${sub}.${BASE_DOMAIN}/v2/"
 done
-# A passthrough registry has no registry:2 to answer 200 -- the upstream's 401
-# challenge is its healthy state. Its token endpoint has to answer too, or a
-# client can never get past that challenge.
-for entry in "${PASSTHROUGH_REGISTRIES[@]}"; do
-  IFS=: read -r sub _ <<<"${entry}"
-  check "registry ${sub} TLS (passthru)" '^(200|401)$' "https://${sub}.${BASE_DOMAIN}/v2/"
-  check "registry ${sub} token" '^200$' "https://${sub}.${BASE_DOMAIN}/token/"
-done
 
 echo
 if [[ "${failed}" -ne 0 ]]; then
@@ -774,7 +744,7 @@ cat <<EOF
 
 Done on ${BASE_DOMAIN}.
 
-  12 Remap entries, 6 registry:2 containers, 1 Caddy registry passthrough (ecr),
+  12 Remap entries, 7 registry containers (${REGISTRY_IMAGE%@*}),
   10 Caddy routes. No licence meter, no admin user, no EULA, no realm.
 
 EOF

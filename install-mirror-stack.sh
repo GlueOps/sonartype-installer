@@ -47,6 +47,7 @@
 #   STACK_DIR           default /opt/mirror-stack
 #   OLD_STACK_DIR       default /opt/nexus-stack
 #   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
+#   CADDY_IMAGE         caddy image, tag@digest
 #   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
 #   LOG_MAX_FILES       rotated log files kept per container, default 5
 #   DRY_RUN=1           generate the config files and stop
@@ -68,6 +69,8 @@ ACNG_UID="${ACNG_UID:-8142}"
 # stock registry:2/registry:3 cannot (distribution#4383): ECR Public answers HEAD
 # on a blob with 401, and the proxy HEADs every blob before fetching it.
 # https://github.com/GlueOps/registry
+CADDY_IMAGE="${CADDY_IMAGE:-caddy:2.11.4@sha256:14a9c00d4e833ebc2b65d36515b37bde3b73f0b323a2663aaafc88953d8c4e3f}"
+
 REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/glueops/registry:v0.0.2@sha256:8cb6fbe5b2e5b969c917026d3f323fcdfceb5d7dab2c1960e26bccd852ca0e82}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
@@ -469,10 +472,20 @@ log "Writing Caddyfile"
     echo
   fi
 
+  # Docker Hub serves official images under library/. A client pulling
+  # dockerhub.<domain>/busybox sends "busybox", which Hub answers with 401;
+  # Nexus added the prefix itself. Multi-segment names, /v2/ and /v2/_catalog
+  # do not match, and containerd mirrors already send library/.
+  hub_short_names() {
+    echo "  @hubshort path_regexp hub ^/v2/([^/]+)/(manifests|blobs|tags|referrers)/(.*)\$"
+    echo "  rewrite @hubshort /v2/library/{re.hub.1}/{re.hub.2}/{re.hub.3}"
+  }
+
   # ---- one pair of sites per registry, same split ----
   for entry in "${REGISTRIES[@]}"; do
     IFS=: read -r name sub _ _ <<<"${entry}"
     echo "$(regional_host "${sub}") {"
+    [[ "${name}" == "dockerhub" ]] && hub_short_names
     echo "  import registry_proxy registry-${name}:5000"
     echo "  log {"
     echo "    output file /data/logs/${name}-access.log"
@@ -483,6 +496,7 @@ log "Writing Caddyfile"
     if [[ -n "${GLOBAL_BASE_DOMAIN}" ]]; then
       echo "$(global_host "${sub}") {"
       echo "  import globalcert"
+      [[ "${name}" == "dockerhub" ]] && hub_short_names
       echo "  import registry_proxy registry-${name}:5000"
       echo "  log {"
       echo "    output file /data/logs/${name}-access.log"
@@ -522,7 +536,7 @@ compose_logging() {
 {
   echo "services:"
   echo "  caddy:"
-  echo "    image: caddy:2"
+  echo "    image: ${CADDY_IMAGE}"
   echo "    container_name: mirror-caddy"
   echo "    restart: unless-stopped"
   compose_logging

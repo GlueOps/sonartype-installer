@@ -15,8 +15,9 @@
 # the Nexus stack, and is kept for deployments that stay under the limits.
 #
 # WHAT IT BUILDS
-#   27 apt suites       -> apt-cacher-ng, 12 Remap entries
-#    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
+#   21 apt suites       -> apt-cacher-ultra, 21 [[mirror]] routes (see APT_REPOS)
+#    6 kubernetes apt   -> apt-cacher-ng, 6 Remap entries (see APT_FLAT_REPOS)
+#    7 registries      -> ghcr.io/glueops/registry in pull-through mode, one per
 #                          upstream (see REGISTRY_IMAGE)
 #    4 helm + 6 raw     -> Caddy reverse_proxy, straight to the upstream
 # No licence meter, no admin user, no EULA, no realm to switch on by hand.
@@ -49,6 +50,7 @@
 #   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
 #   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
 #   LOG_MAX_FILES       rotated log files kept per container, default 5
+#   APT_ARCHITECTURES   architectures apt-cacher-ultra adopts, default "amd64 arm64"
 #   DRY_RUN=1           generate the config files and stop
 set -euo pipefail
 
@@ -63,6 +65,20 @@ GLOBAL_CERT_NAME="${GLOBAL_CERT_NAME:-${GLOBAL_BASE_DOMAIN}}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 
 ACNG_UID="${ACNG_UID:-8142}"
+ACU_UID="${ACU_UID:-8143}"
+
+# apt-cacher-ultra (https://github.com/linsomniac/apt-cacher-ultra) publishes a
+# static linux-amd64 binary per release and no container image, so the image is
+# built here from that binary, checked against the release's SHA256SUMS. Bump
+# the version and the digest together.
+ACU_VERSION="${ACU_VERSION:-1.0.2}"
+ACU_SHA256="${ACU_SHA256:-085a0dff37f41baa70b82a3ce8bffca0b899b0488cd3f50f68715564ba8b5343}"
+
+# Adoption fetches every per-architecture index a suite declares, so each extra
+# architecture is another set of Packages files per suite per change. A client
+# on an architecture not listed here gets a 404 for its Packages index.
+APT_ARCHITECTURES="${APT_ARCHITECTURES:-amd64 arm64}"
+
 # The helm and raw cache. Charts and release binaries are small next to
 # container layers; this is a ceiling, not an allocation.
 NGINX_CACHE_MAX_SIZE="${NGINX_CACHE_MAX_SIZE:-20g}"
@@ -118,19 +134,71 @@ OFFICIAL_NAMESPACE=(
   "dockerhub:library"
 )
 
-# Everything apt-cacher-ng answers for. The Remap table inside acng.conf is what
-# maps these onto upstreams; Caddy only needs to know the set, to route it.
+# name|upstream -- apt-cacher-ultra, one [[mirror]] route each. Pipe separated,
+# because the upstream is a URL.
+#
+# apt-cacher-ultra serves cached metadata from disk and checks upstream in the
+# background, and publishes a new InRelease only once every index it names has
+# been fetched and verified. So an outage costs nothing on a cache hit. Under
+# apt-cacher-ng the same outage turned every InRelease into a 503 after ~90s,
+# and a node with no package lists could not install anything.
+#
+# Several names on one upstream share a cache: the key is the upstream URL, so
+# the nine ubuntu-* names hold one copy of pool/, as the Remap grouping did.
+# archive.ubuntu.com carries every suite including -security.
+# debian-security is a genuinely separate archive with its own pool/.
 APT_REPOS=(
-  ubuntu-jammy ubuntu-jammy-updates ubuntu-jammy-security
-  ubuntu-noble ubuntu-noble-updates ubuntu-noble-security
-  ubuntu-resolute ubuntu-resolute-updates ubuntu-resolute-security
-  debian-bookworm debian-bookworm-updates debian-bookworm-security
-  debian-trixie debian-trixie-updates debian-trixie-security
+  "ubuntu-jammy|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-jammy-updates|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-jammy-security|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-noble|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-noble-updates|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-noble-security|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-resolute|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-resolute-updates|http://archive.ubuntu.com/ubuntu"
+  "ubuntu-resolute-security|http://archive.ubuntu.com/ubuntu"
+  "debian-bookworm|https://deb.debian.org/debian"
+  "debian-bookworm-updates|https://deb.debian.org/debian"
+  "debian-bookworm-security|https://security.debian.org/debian-security"
+  "debian-trixie|https://deb.debian.org/debian"
+  "debian-trixie-updates|https://deb.debian.org/debian"
+  "debian-trixie-security|https://security.debian.org/debian-security"
+  "docker-ubuntu-jammy|https://download.docker.com/linux/ubuntu"
+  "docker-ubuntu-noble|https://download.docker.com/linux/ubuntu"
+  "docker-ubuntu-resolute|https://download.docker.com/linux/ubuntu"
+  "docker-debian-bookworm|https://download.docker.com/linux/debian"
+  "docker-debian-trixie|https://download.docker.com/linux/debian"
+  # distribution=any against a remote already ending in /any/, so the upstream
+  # path really is .../helm-debian/any/dists/any/. Preserved verbatim.
+  "helm-apt|https://packages.buildkite.com/helm-linux/helm-debian/any"
+)
+
+# Flat repositories -- `deb <url>/ /`, no dists/<suite>/ -- stay on
+# apt-cacher-ng, with the Remap entries in acng.conf.
+#
+# apt-cacher-ultra 1.0.2 only recognises a suite under dists/<suite>/. A flat
+# repository's InRelease is cached on first fetch and then served forever:
+# verified with a local upstream whose InRelease changed, which was still served
+# the original 100s later, after a single upstream request, and never produced a
+# freshness check. pkgs.k8s.io publishes every minor as a flat repository, so
+# moving these would freeze nodes on the first kubelet patch release seen.
+# Move them when apt-cacher-ultra refreshes flat repositories.
+APT_FLAT_REPOS=(
   kubernetes-v1-32 kubernetes-v1-33 kubernetes-v1-34
   kubernetes-v1-35 kubernetes-v1-36 kubernetes-v1-37
-  docker-ubuntu-jammy docker-ubuntu-noble docker-ubuntu-resolute
-  docker-debian-bookworm docker-debian-trixie
-  helm-apt
+)
+
+# host|fingerprint|key URL -- signing keys apt-cacher-ultra does not embed.
+#
+# It verifies every InRelease before adopting it, against its built-in Ubuntu
+# and Debian archive keys plus whatever is in its keyring directory. The keys
+# below are fetched into that directory on each run, and pinned to their
+# fingerprint with a [[trusted_signer]] rule, so a key served from anywhere else
+# is refused at adoption rather than trusted. A refused adoption keeps serving
+# the previous snapshot.
+APT_SIGNERS=(
+  "download.docker.com|9DC858229FC7DD38854AE2D88D81803C0EBFCD88|https://download.docker.com/linux/ubuntu/gpg"
+  "packages.buildkite.com|DDF78C3E6EBB2D2CC223C95C62BA89D07698DBC6|https://packages.buildkite.com/helm-linux/helm-debian/gpgkey"
 )
 
 # name:upstream host:upstream path prefix
@@ -213,12 +281,21 @@ fi
 # docker compose up -d recreates a container when its *service definition*
 # changes -- image, environment, the list of volumes. It does not notice that
 # the contents of a bind-mounted file changed, so a run that alters only the
-# Caddyfile or acng.conf brings up nothing and silently leaves the old config
-# serving. That has to be handled explicitly below, and it needs the old
-# checksums taken before anything is rewritten.
+# Caddyfile, acng.conf or the apt-cacher-ultra config brings up nothing and
+# silently leaves the old config serving. That has to be handled explicitly
+# below, and it needs the old checksums taken before anything is rewritten.
 cfg_sum() { [[ -f "$1" ]] && sha256sum "$1" | cut -d" " -f1 || echo "absent"; }
+# apt-cacher-ultra reads its keyring at startup too, so a changed key needs the
+# same restart as a changed config. On a first run none of these exist yet, and
+# under pipefail a failing cat would kill the script silently at the assignment
+# below -- so absent files hash as nothing, which still differs from the result.
+acu_sum() {
+  { cat "${STACK_DIR}/apt-cacher-ultra.toml" "${STACK_DIR}"/apt-keys/*.asc 2>/dev/null || true; } \
+    | sha256sum | cut -d" " -f1
+}
 CADDY_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/Caddyfile")"
 ACNG_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/acng.conf")"
+ACU_SUM_BEFORE="$(acu_sum)"
 
 # A host with no room left fails deep inside `docker build`, as "You don't have
 # enough free space in /var/cache/apt/archives/" buried in a layer log -- which
@@ -248,7 +325,7 @@ thing on disk and is safe to remove once the new stack has proven itself:
 fi
 
 log "Preparing ${STACK_DIR}"
-mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-cache,apt-log,registries,content-cache,content-log}
+mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-cache,apt-log,apt-cache-ultra,apt-keys,registries,content-cache,content-log}
 mkdir -p "${STACK_DIR}/site"
 for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ _ _ <<<"${entry}"
@@ -257,6 +334,28 @@ done
 
 if [[ "${DRY_RUN}" != "1" ]]; then
   chown -R "${ACNG_UID}:${ACNG_UID}" "${STACK_DIR}/apt-cache" "${STACK_DIR}/apt-log"
+  chown -R "${ACU_UID}:${ACU_UID}" "${STACK_DIR}/apt-cache-ultra"
+
+  # Fetched on every run so a rotated key is picked up, but only replaced when
+  # the download succeeds: a re-run during an upstream outage keeps the key it
+  # has. With no key at all, adoption for that host would be refused forever --
+  # the suite serves whatever it first cached and never updates -- so that is a
+  # hard stop, before anything is running. The fingerprint pin is enforced by
+  # apt-cacher-ultra's [[trusted_signer]], not here.
+  log "Fetching apt signing keys"
+  for entry in "${APT_SIGNERS[@]}"; do
+    IFS='|' read -r host _ url <<<"${entry}"
+    key="${STACK_DIR}/apt-keys/${host}.asc"
+    if curl -fsSL --max-time 30 "${url}" -o "${key}.new" && [[ -s "${key}.new" ]]; then
+      mv "${key}.new" "${key}"
+    else
+      rm -f "${key}.new"
+      [[ -s "${key}" ]] || die "could not fetch the signing key for ${host} from ${url}, and none is cached.
+apt-cacher-ultra would refuse every update for that repository. Nothing has
+been stopped; re-run once ${url} is reachable."
+      echo "    ${host}: fetch failed, keeping the cached key"
+    fi
+  done
 
   # registry:2 left expiry state behind. With REGISTRY_PROXY_TTL=0 it's ignored, but
   # every entry is long past due, so setting a TTL later would purge the whole cache
@@ -287,7 +386,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# apt-cacher-ng: same image and Remap table as deploy-apt-cache.sh
+# apt-cacher-ng: the flat kubernetes repositories only (see APT_FLAT_REPOS)
 # ---------------------------------------------------------------------------
 log "Writing Dockerfile.acng"
 cat > "${STACK_DIR}/Dockerfile.acng" <<EOF
@@ -323,17 +422,6 @@ ExThreshold: 24
 VerboseLog: 1
 ReportPage: acng-report.html
 
-# Several local prefixes on one Remap share a cache tree. The nine ubuntu-*
-# repositories differ only by the suite in the path and share an identical
-# pool/, so they get one tree rather than nine copies of every .deb.
-# archive.ubuntu.com carries every suite including -security.
-Remap-ubuntu: /repository/ubuntu-jammy /repository/ubuntu-jammy-updates /repository/ubuntu-jammy-security /repository/ubuntu-noble /repository/ubuntu-noble-updates /repository/ubuntu-noble-security /repository/ubuntu-resolute /repository/ubuntu-resolute-updates /repository/ubuntu-resolute-security ; http://archive.ubuntu.com/ubuntu http://security.ubuntu.com/ubuntu
-
-# debian-security is a genuinely separate archive with its own pool/, so unlike
-# Ubuntu it does NOT merge with the main one.
-Remap-debian: /repository/debian-bookworm /repository/debian-bookworm-updates /repository/debian-trixie /repository/debian-trixie-updates ; https://deb.debian.org/debian
-Remap-debiansecurity: /repository/debian-bookworm-security /repository/debian-trixie-security ; https://security.debian.org/debian-security
-
 # pkgs.k8s.io publishes each minor as an independent flat repository: no shared
 # pool, so merging would be wrong.
 Remap-k8s132: /repository/kubernetes-v1-32 ; https://pkgs.k8s.io/core:/stable:/v1.32/deb
@@ -342,15 +430,84 @@ Remap-k8s134: /repository/kubernetes-v1-34 ; https://pkgs.k8s.io/core:/stable:/v
 Remap-k8s135: /repository/kubernetes-v1-35 ; https://pkgs.k8s.io/core:/stable:/v1.35/deb
 Remap-k8s136: /repository/kubernetes-v1-36 ; https://pkgs.k8s.io/core:/stable:/v1.36/deb
 Remap-k8s137: /repository/kubernetes-v1-37 ; https://pkgs.k8s.io/core:/stable:/v1.37/deb
-
-# download.docker.com publishes linux/ubuntu and linux/debian as separate trees.
-Remap-dockerubuntu: /repository/docker-ubuntu-jammy /repository/docker-ubuntu-noble /repository/docker-ubuntu-resolute ; https://download.docker.com/linux/ubuntu
-Remap-dockerdebian: /repository/docker-debian-bookworm /repository/docker-debian-trixie ; https://download.docker.com/linux/debian
-
-# distribution=any against a remote already ending in /any/, so the upstream path
-# really is .../helm-debian/any/dists/any/. Preserved verbatim.
-Remap-helmapt: /repository/helm-apt ; https://packages.buildkite.com/helm-linux/helm-debian/any
 EOF
+
+# ---------------------------------------------------------------------------
+# apt-cacher-ultra: every repository in APT_REPOS
+# ---------------------------------------------------------------------------
+log "Writing Dockerfile.acu"
+cat > "${STACK_DIR}/Dockerfile.acu" <<EOF
+FROM debian:trixie-slim
+RUN apt-get update \\
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+      ca-certificates curl \\
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSLo /usr/local/bin/apt-cacher-ultra \\
+      https://github.com/linsomniac/apt-cacher-ultra/releases/download/${ACU_VERSION}/apt-cacher-ultra-${ACU_VERSION}-linux-amd64 \\
+ && echo "${ACU_SHA256}  /usr/local/bin/apt-cacher-ultra" | sha256sum -c - \\
+ && chmod 0755 /usr/local/bin/apt-cacher-ultra \\
+ && groupadd -g ${ACU_UID} apt-cacher-ultra \\
+ && useradd -u ${ACU_UID} -g ${ACU_UID} -d /var/cache/apt-cacher-ultra -s /usr/sbin/nologin apt-cacher-ultra
+USER apt-cacher-ultra
+ENTRYPOINT ["/usr/local/bin/apt-cacher-ultra", "-config", "/etc/apt-cacher-ultra/config.toml"]
+EOF
+
+log "Writing apt-cacher-ultra.toml"
+{
+  echo "# Generated by install-mirror-stack.sh. Reference:"
+  echo "# https://github.com/linsomniac/apt-cacher-ultra/blob/${ACU_VERSION}/docs/configuration.md"
+  echo "[cache]"
+  echo "dir    = \"/var/cache/apt-cacher-ultra\""
+  echo "listen = \"0.0.0.0:3142\""
+  echo
+  echo "[upstream]"
+  echo "# Every host is allowed, and that is not an open relay: Caddy forwards only"
+  echo "# /repository/<name>/ paths, and a path matching no [[mirror]] route is a 400."
+  echo "# An allowlist would also have to name the CDNs upstreams redirect to, which"
+  echo "# they are free to change."
+  echo "allowed_host_regex = ['^.*\$']"
+  echo
+  echo "[adoption]"
+  echo "# Without adoption a changed InRelease is logged and never served: clients"
+  echo "# would keep the first copy ever cached."
+  echo "enabled      = true"
+  echo "keyring_dirs = [\"/etc/apt-cacher-ultra/keys\"]"
+  printf 'architectures = [%s]\n' "$(printf '"%s", ' ${APT_ARCHITECTURES} | sed 's/, $//')"
+  echo
+  echo "[gc]"
+  echo "# A .deb nobody requested for this long, and that is not among the newest"
+  echo "# versions, becomes collectable. The default is 7 days; a package a node"
+  echo "# installs once a month at bootstrap should survive an outage too. This is"
+  echo "# apt-cacher-ng's ExThreshold rounded up."
+  echo "url_path_ttl = \"720h\""
+  echo
+  echo "[admin]"
+  echo "# /healthz, /metrics and the status page. Inside the container only: the"
+  echo "# port is not published and POST /reconcile is unauthenticated."
+  echo "listen = \"127.0.0.1:6789\""
+  echo
+  echo "[log]"
+  echo "format = \"json\""
+  echo
+  echo "[tls_mitm]"
+  echo "# Clients reach this by path through Caddy, never as a forward proxy, so"
+  echo "# there is no CONNECT to intercept and no CA to distribute."
+  echo "enabled = false"
+  for entry in "${APT_SIGNERS[@]}"; do
+    IFS='|' read -r host fpr _ <<<"${entry}"
+    echo
+    echo "[[trusted_signer]]"
+    echo "match_canonical_host = '^${host//./\\.}\$'"
+    echo "fingerprints = ['${fpr}']"
+  done
+  for entry in "${APT_REPOS[@]}"; do
+    IFS='|' read -r name upstream <<<"${entry}"
+    echo
+    echo "[[mirror]]"
+    echo "prefix   = \"/repository/${name}\""
+    echo "upstream = \"${upstream}\""
+  done
+} > "${STACK_DIR}/apt-cacher-ultra.toml"
 
 
 # ---------------------------------------------------------------------------
@@ -507,8 +664,12 @@ log "Writing landing page"
     IFS=: read -r _ sub _ up <<<"${entry}"
     echo "<li><code>${sub}.${BASE_DOMAIN}</code> &rarr; ${up}</li>"
   done
-  echo "</ul><h2>APT (${#APT_REPOS[@]})</h2><ul>"
-  for r in "${APT_REPOS[@]}"; do echo "<li><code>/repository/${r}/</code></li>"; done
+  echo "</ul><h2>APT ($(( ${#APT_REPOS[@]} + ${#APT_FLAT_REPOS[@]} )))</h2><ul>"
+  for entry in "${APT_REPOS[@]}"; do
+    IFS='|' read -r name upstream <<<"${entry}"
+    echo "<li><code>/repository/${name}/</code> &rarr; ${upstream}</li>"
+  done
+  for r in "${APT_FLAT_REPOS[@]}"; do echo "<li><code>/repository/${r}/</code></li>"; done
   echo "</ul><h2>Helm</h2><ul>"
   for entry in "${HELM_REPOS[@]}"; do
     IFS=: read -r name host path <<<"${entry}"
@@ -559,9 +720,12 @@ official_rewrite() {
   echo "  rewrite @official /v2/$1/{re.official.1}/{re.official.2}/{re.official.3}"
 }
 
-# Build the apt route matcher from the table above, so the Caddyfile and the
-# Remap table cannot drift apart silently.
-apt_alternation="$(IFS='|'; echo "${APT_REPOS[*]}")"
+# Build the apt route matchers from the tables above, so the Caddyfile and the
+# two caches' configs cannot drift apart silently.
+apt_names=()
+for entry in "${APT_REPOS[@]}"; do apt_names+=("${entry%%|*}"); done
+apt_alternation="$(IFS='|'; echo "${apt_names[*]}")"
+apt_flat_alternation="$(IFS='|'; echo "${APT_FLAT_REPOS[*]}")"
 
 log "Writing Caddyfile"
 {
@@ -623,10 +787,18 @@ log "Writing Caddyfile"
   echo "    respond \"ok\" 200"
   echo "  }"
   echo
-  echo "  # ---- APT: ${#APT_REPOS[@]} repositories, one upstream ----"
+  echo "  # ---- APT: ${#APT_REPOS[@]} repositories on apt-cacher-ultra ----"
   echo "  @apt path_regexp ^/repository/(${apt_alternation})(/|\$)"
   echo "  handle @apt {"
   echo "    reverse_proxy apt-cache:3142 {"
+  echo "      header_up Host {host}"
+  echo "    }"
+  echo "  }"
+  echo
+  echo "  # ---- APT: ${#APT_FLAT_REPOS[@]} flat repositories on apt-cacher-ng ----"
+  echo "  @apt_flat path_regexp ^/repository/(${apt_flat_alternation})(/|\$)"
+  echo "  handle @apt_flat {"
+  echo "    reverse_proxy apt-cache-ng:3142 {"
   echo "      header_up Host {host}"
   echo "    }"
   echo "  }"
@@ -761,6 +933,7 @@ compose_logging() {
   echo "      - ${STACK_DIR}/certs:/certs:ro"
   echo "    depends_on:"
   echo "      - apt-cache"
+  echo "      - apt-cache-ng"
   echo "      - content-cache"
   echo
   echo "  content-cache:"
@@ -781,8 +954,26 @@ compose_logging() {
   echo "  apt-cache:"
   echo "    build:"
   echo "      context: ."
-  echo "      dockerfile: Dockerfile.acng"
+  echo "      dockerfile: Dockerfile.acu"
   echo "    container_name: apt-cache"
+  echo "    restart: unless-stopped"
+  compose_logging
+  echo "    volumes:"
+  echo "      - ${STACK_DIR}/apt-cacher-ultra.toml:/etc/apt-cacher-ultra/config.toml:ro"
+  echo "      - ${STACK_DIR}/apt-keys:/etc/apt-cacher-ultra/keys:ro"
+  echo "      - ${STACK_DIR}/apt-cache-ultra:/var/cache/apt-cacher-ultra"
+  echo "    healthcheck:"
+  echo "      test: [\"CMD-SHELL\", \"curl -fsS http://127.0.0.1:6789/healthz >/dev/null\"]"
+  echo "      interval: 30s"
+  echo "      timeout: 5s"
+  echo "      retries: 3"
+  echo "      start_period: 10s"
+  echo
+  echo "  apt-cache-ng:"
+  echo "    build:"
+  echo "      context: ."
+  echo "      dockerfile: Dockerfile.acng"
+  echo "    container_name: apt-cache-ng"
   echo "    restart: unless-stopped"
   compose_logging
   echo "    volumes:"
@@ -889,10 +1080,18 @@ fi
 
 if [[ "$(cfg_sum "${STACK_DIR}/acng.conf")" != "${ACNG_SUM_BEFORE}" ]]; then
   # apt-cacher-ng has no reload; the config is read at startup only.
-  log "acng.conf changed, restarting apt-cache"
-  docker compose restart apt-cache
+  log "acng.conf changed, restarting apt-cache-ng"
+  docker compose restart apt-cache-ng
 else
   log "acng.conf unchanged"
+fi
+
+if [[ "$(acu_sum)" != "${ACU_SUM_BEFORE}" ]]; then
+  # No reload here either: config and keyring are read at startup only.
+  log "apt-cacher-ultra config or keys changed, restarting apt-cache"
+  docker compose restart apt-cache
+else
+  log "apt-cacher-ultra config and keys unchanged"
 fi
 
 # ---------------------------------------------------------------------------
@@ -955,6 +1154,8 @@ echo
 log "Public checks over TLS"
 check "apt  ubuntu-noble" '^200$' "https://${BASE_DOMAIN}/repository/ubuntu-noble/dists/noble/InRelease"
 check "apt  debian-trixie" '^200$' "https://${BASE_DOMAIN}/repository/debian-trixie/dists/trixie/InRelease"
+check "apt  docker-ubuntu-noble" '^200$' "https://${BASE_DOMAIN}/repository/docker-ubuntu-noble/dists/noble/InRelease"
+check "apt  helm-apt" '^200$' "https://${BASE_DOMAIN}/repository/helm-apt/dists/any/InRelease"
 check "apt  kubernetes-v1-34" '^200$' "https://${BASE_DOMAIN}/repository/kubernetes-v1-34/Release"
 check "helm helm-tigera" '^200$' "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"
 check "helm helm-metrics-server" '^200$' "https://${BASE_DOMAIN}/repository/helm-metrics-server/index.yaml"
@@ -1033,7 +1234,8 @@ cat <<EOF
 
 Done on ${BASE_DOMAIN}.
 
-  12 Remap entries, 7 registry containers (${REGISTRY_IMAGE%@*}),
+  ${#APT_REPOS[@]} apt-cacher-ultra ${ACU_VERSION} routes, ${#APT_FLAT_REPOS[@]} apt-cacher-ng Remap entries,
+  7 registry containers (${REGISTRY_IMAGE%@*}),
   10 Caddy routes. No licence meter, no admin user, no EULA, no realm.
 
 EOF

@@ -37,15 +37,15 @@ sudo BASE_DOMAIN=repo.example.com \
 
 | Was, under Nexus | Is |
 | --- | --- |
-| 27 apt proxy repositories | apt-cacher-ng, **12** `Remap` entries |
+| 27 apt proxy repositories | [apt-cacher-ultra](https://github.com/linsomniac/apt-cacher-ultra), **21** `[[mirror]]` routes; apt-cacher-ng for the **6** flat kubernetes repositories (below) |
 | 7 docker proxy repositories | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
 | 4 helm + 6 raw proxy repositories | Caddy `reverse_proxy`, straight to the upstream |
 | Nexus UI | a static index of what the host serves, plus `/healthz` |
 
 No admin user, no EULA, and no *Docker Bearer Token Realm* to switch on by hand
 after every rebuild. Client URLs are unchanged: `/repository/<name>/` is a Nexus
-path convention, but apt-cacher-ng's `Remap` and Caddy's `handle_path` reproduce
-it verbatim, so no `sources.list` or `helm repo add` in your estate has to move.
+path convention, but apt-cacher-ultra's `[[mirror]]` prefixes, apt-cacher-ng's
+`Remap` and nginx's locations reproduce it verbatim, so no `sources.list` or `helm repo add` in your estate has to move.
 
 Every cache is plain local disk. Upstream is explicit that a pull-through
 registry cache uses the `filesystem` storage driver, and all six raw proxies ran
@@ -80,7 +80,8 @@ its TLS material is carried across first. Rollback is a compose up in the old
 stack directory. On a host with no Nexus, that phase is skipped entirely.
 
 Images are built *before* anything is stopped, so a failed build is not an
-outage. `DRY_RUN=1` writes the compose file, Caddyfile and `acng.conf` and stops.
+outage. `DRY_RUN=1` writes the compose file, Caddyfile, `acng.conf`,
+`apt-cacher-ultra.toml` and `nginx.conf` and stops.
 
 ### Two things that will bite you
 
@@ -190,6 +191,67 @@ carries a signed URL long enough that the default 4k buffer fails the request as
 0: nginx writes a response to a temp file on its way into the cache, so
 disabling that silently stops anything larger than the buffers from ever being
 cached.
+
+### APT goes through apt-cacher-ultra
+
+[apt-cacher-ultra](https://github.com/linsomniac/apt-cacher-ultra) serves cached
+metadata from disk and checks upstream in the background, and publishes a new
+`InRelease` only after every index it names has been fetched and verified. It
+replaces apt-cacher-ng for every `dists/`-style repository because of what each
+does when the upstream is unreachable. Measured on the same host, with a
+**new node** (no package lists) running `apt-get update` and installing
+packages already cached:
+
+| Upstream blackholed | apt-cacher-ng | apt-cacher-ultra |
+| --- | --- | --- |
+| ubuntu-noble ×3 + docker + helm-apt | every `InRelease` 500/503 | updates and installs in 6s |
+| debian-trixie ×3 + docker | every `InRelease` 500/503 | updates and installs in 6s |
+| a package never cached | fails | fails (slowly: ~250s before apt gives up) |
+
+A node that already had package lists could still install cached packages under
+apt-cacher-ng, after `apt-get update` spent ~90s failing; it was new nodes — the ones a cluster adds during an incident —
+that could not.
+
+**The kubernetes repositories stay on apt-cacher-ng.** apt-cacher-ultra 1.0.2
+recognises a suite only under `dists/<suite>/`. `pkgs.k8s.io` publishes each
+minor as a flat repository (`deb …/ /`), and a flat repository's `InRelease` is
+cached once and then served forever — verified against a local upstream whose
+`InRelease` changed. Moving them would freeze every node on the first kubelet
+patch release seen. They move when apt-cacher-ultra refreshes flat repositories;
+until then they keep apt-cacher-ng's outage behaviour.
+
+**Adoption is on, and must stay on.** It is off in apt-cacher-ultra's defaults,
+and with it off a changed `InRelease` is logged and never served. Adoption
+verifies each `InRelease` before publishing it: Ubuntu and Debian against the
+archive keys built into the binary, Docker CE and helm-apt against keys fetched
+into `apt-keys/` on each run and pinned by fingerprint (`APT_SIGNERS`). A key
+that does not match is refused and the previous snapshot keeps serving.
+
+**Architectures are `amd64` and `arm64`** (`APT_ARCHITECTURES`). Adoption fetches
+every per-architecture index a suite declares, so the list is a disk and
+bandwidth decision. A client on another architecture gets a 404 for its
+`Packages` index. `source` is not included, so `deb-src` lines do not work.
+
+**Unrequested packages are kept 30 days** (`url_path_ttl`, the default is 7): a
+package a node installs once a month at bootstrap should survive an outage too.
+The newest three versions of each package in a current snapshot are kept
+regardless (`retention.max_versions_per_package`, left at its default).
+
+**On a host migrated from apt-cacher-ng**, apt-cacher-ultra starts cold and fills
+on demand. apt-cacher-ng's trees for the moved repositories are no longer read;
+reclaim them once the new cache has served real traffic:
+
+```sh
+cd /opt/mirror-stack/apt-cache
+rm -rf ubuntu debian debiansecurity dockerubuntu dockerdebian helmapt
+```
+
+The status page, `/metrics` and `POST /reconcile` listen on `127.0.0.1:6789`
+inside the `apt-cache` container only:
+
+```sh
+docker exec apt-cache curl -s http://127.0.0.1:6789/metrics | grep ^acu_
+```
 
 ## `install.sh` (Nexus)
 

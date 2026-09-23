@@ -10,7 +10,7 @@ Two standalone installers. Neither imports the other; both generate a
 
 | Script | Builds | Status |
 | --- | --- | --- |
-| `install-mirror-stack.sh` | apt-cacher-ng + `ghcr.io/glueops/registry` + Caddy | current |
+| `install-mirror-stack.sh` | apt-cacher-ultra (+ apt-cacher-ng for flat repos) + `ghcr.io/glueops/registry` + nginx + Caddy | current |
 | `install.sh` | Sonatype Nexus + Caddy | legacy — under a usage meter from 15 Oct 2026 |
 
 There is no build system, no test suite and no dependency manifest. A change is
@@ -134,10 +134,28 @@ fault.
 live on `ports.ubuntu.com/ubuntu-ports`. Debian is unaffected — `deb.debian.org`
 carries every architecture.
 
+**apt-cacher-ultra must keep `[adoption] enabled = true`.** With adoption off, a
+changed upstream `InRelease` is logged ("InRelease changed at upstream") and
+never served: every client keeps the first copy ever cached, and never sees a
+security update. It is off in the upstream defaults.
+
+**Flat apt repositories cannot move to apt-cacher-ultra (1.0.2).** It recognises
+a suite only under `dists/<suite>/`; a flat repository's (`deb <url>/ /`)
+`InRelease` is cached once and served forever. That is why `APT_FLAT_REPOS` —
+every `pkgs.k8s.io` minor — stays on apt-cacher-ng. Check this before moving
+them or adding another flat repository.
+
+**Every non-Ubuntu, non-Debian apt host needs a signer.** apt-cacher-ultra
+verifies each `InRelease` before adopting it and embeds only the Ubuntu and
+Debian archive keys. A dists-style repository on any other host needs an
+`APT_SIGNERS` entry, or its adoption is refused and it serves the first snapshot
+forever — silently, as far as clients can tell.
+
 ## Do not change client-facing URLs
 
-`/repository/<name>/` is a Nexus path convention that `Remap` and `handle_path`
-reproduce deliberately, so an existing estate can point at this installer
+`/repository/<name>/` is a Nexus path convention that apt-cacher-ultra's
+`[[mirror]]` prefixes, apt-cacher-ng's `Remap` and nginx's locations reproduce
+deliberately, so an existing estate can point at this installer
 without editing a single `sources.list` or `helm repo add`. Renaming a
 repository breaks every client silently — they get a 404, not an error that
 explains itself.
@@ -145,6 +163,7 @@ explains itself.
 ## Adding a repository
 
 See **Adding a repository** in `README.md`. The short version: each kind lives
-in one table near the top of `install-mirror-stack.sh`, and APT additionally
-needs a `Remap` line whose grouping decides whether the upstream's `pool/` is
-shared or duplicated on disk.
+in one table near the top of `install-mirror-stack.sh`. An APT repository is a
+`name|upstream` line in `APT_REPOS`; names sharing an upstream URL share its
+`pool/` on disk. A flat repository goes in `APT_FLAT_REPOS` with a `Remap` line
+in `acng.conf` instead, and a new signing host needs an `APT_SIGNERS` entry.

@@ -92,10 +92,10 @@ them apart: regional on ACME, global on the pre-issued wildcard.
 
 **`X-Forwarded-*` is stripped from helm and raw upstream requests.** Those are
 third-party CDNs being fetched as an ordinary client, which is what Nexus did.
-`packages.buildkite.com` is the proof: it answers any request carrying an
-`X-Forwarded-Proto` with a 301 to its marketing site instead of the signed URL
-for the signing key — whether the value says `http` or `https`. The registry and
-apt routes keep their headers; those backends are yours.
+`packages.buildkite.com` is the proof: it answers a request carrying
+`X-Forwarded-Host` with a 301 to its marketing site instead of the signed URL
+for the signing key. The registry and apt routes keep their headers; those
+backends are yours.
 
 ### Registries run `ghcr.io/glueops/registry`
 
@@ -173,7 +173,8 @@ compressed body** — without it the rewrite silently does nothing at all.
 `packages.buildkite.com` all answer a download with a 302 to a CDN. Handing that
 back means the client needs its own egress, nothing is cached, and an outage is
 a hard failure. nginx follows them with `proxy_intercept_errors` and a named
-location, for chains of up to 10 hops. The cache key stays the **original request path**: buildkite's
+location, for chains of up to 10 hops. The cache key stays the **original
+request path**: buildkite's
 CloudFront URLs are signed and expiring, and GitHub's asset CDN hostname has
 already changed once, so keying on the target would never hit.
 
@@ -184,9 +185,9 @@ returns 200 from disk while a path that was never cached returns 504.
 
 **Raw revalidates on every request**, as `contentMaxAge: 0` did under Nexus:
 `proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
-served on error, timeout, 5xx, 429, 403 and 404. A stopped upstream costs 5s
-(connect timeout) and a hanging one 30s (read timeout) before the cached copy is
-served. Two cases get no cached copy: a redirect chain longer than 10 hops
+served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
+back immediately, an unreachable upstream after 5–10s (connect timeout, one
+retry), and a hanging one after 30s (read timeout). Two cases get no cached copy: a redirect chain longer than 10 hops
 (500), and a redirect target whose DNS fails (502).
 
 Two settings that are not optional. `proxy_buffer_size 32k` — GitHub's 302
@@ -306,8 +307,8 @@ including `pkgs.k8s.io` via its CDN redirect. It also serves the cache when
 revalidation fails outright, so an unreachable or erroring upstream degrades to
 the cached copy rather than to an error.
 
-`install-mirror-stack.sh` reproduces this in nginx; see *Stale is served on
-error* above.
+`install-mirror-stack.sh` reproduces this in nginx; see *Raw revalidates on
+every request* above.
 
 ### Changing a repository that already exists
 

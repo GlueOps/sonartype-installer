@@ -64,8 +64,8 @@ itself.
 directive applies to every address on its block, so merging them serves the
 regional names a certificate that does not match. Keep them in separate blocks.
 
-**Do not remove the `header_up -X-Forwarded-*` lines** (`strip_forwarded`,
-called in the route to nginx). Caddy logs
+**Do not remove the `header_up -X-Forwarded-*` lines** in `strip_forwarded`.
+Caddy logs
 `Unnecessary header_up X-Forwarded-Proto` once per stripped route. That warning
 is wrong: it matches the header name without noticing the leading `-` that makes
 it a deletion. Verified against a controlled upstream that all three headers
@@ -78,8 +78,8 @@ Caddy, not nginx: a location-level `proxy_set_header` drops the http-level list.
 container when the *service definition* changes — image, environment, volume
 list — not when the contents of a bind-mounted file change. A run that rewrites
 only the Caddyfile brings up nothing and leaves the old config serving. The
-script checksums all three config files (Caddyfile, acng.conf, nginx.conf) and
-reloads or restarts only what changed; keep that if you touch this area.
+script checksums the Caddyfile and acng.conf and reloads or restarts only what
+changed, and reloads nginx on every run; keep that if you touch this area.
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
 answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests

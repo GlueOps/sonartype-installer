@@ -18,8 +18,7 @@
 #   27 apt suites       -> apt-cacher-ng, 12 Remap entries
 #    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
 #                          upstream (see REGISTRY_IMAGE)
-#    4 helm + 6 raw     -> nginx cache behind Caddy (redirects followed, stale
-#                          served when the upstream fails)
+#    4 helm + 6 raw     -> nginx cache behind Caddy
 # No licence meter, no admin user, no EULA, no realm to switch on by hand.
 #
 # Every cache is plain local disk. Upstream is explicit that a pull-through
@@ -180,9 +179,8 @@ CHART_URL_REWRITES=(
 # outage is a hard failure -- which is the opposite of what a mirror is for.
 #
 # nginx follows them with proxy_intercept_errors plus a named location that
-# proxies to $upstream_http_location, for chains of up to 10 hops (nginx's
-# internal-redirect cap; beyond that it answers 500). The cache key stays the
-# ORIGINAL request path, not the redirect target: buildkite's CloudFront URLs are signed and
+# proxies to $upstream_http_location, up to nginx's 10-hop cap (500 beyond).
+# The cache key stays the ORIGINAL request path, not the redirect target: buildkite's CloudFront URLs are signed and
 # expiring and GitHub's CDN hostname has already changed once, so keying on the
 # target would mean never getting a cache hit.
 
@@ -212,13 +210,12 @@ fi
 # docker compose up -d recreates a container when its *service definition*
 # changes -- image, environment, the list of volumes. It does not notice that
 # the contents of a bind-mounted file changed, so a run that alters only the
-# Caddyfile, acng.conf or nginx.conf brings up nothing and silently leaves the
-# old config serving. That has to be handled explicitly below, and it needs the
-# old checksums taken before anything is rewritten.
+# Caddyfile or acng.conf brings up nothing and silently leaves the old config
+# serving. That has to be handled explicitly below, and it needs the old
+# checksums taken before anything is rewritten. nginx is reloaded every run.
 cfg_sum() { [[ -f "$1" ]] && sha256sum "$1" | cut -d" " -f1 || echo "absent"; }
 CADDY_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/Caddyfile")"
 ACNG_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/acng.conf")"
-NGINX_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/nginx.conf")"
 
 # A host with no room left fails deep inside `docker build`, as "You don't have
 # enough free space in /var/cache/apt/archives/" buried in a layer log -- which
@@ -419,8 +416,7 @@ log "Writing nginx.conf"
   echo "  # stops anything larger than the buffers from ever being cached."
   echo "  proxy_max_temp_file_size 2048m;"
   echo
-  echo "  # X-Forwarded-* are stripped in Caddy (strip_forwarded). An http-level"
-  echo "  # proxy_set_header here would be dropped by every location that sets its own."
+  echo "  # X-Forwarded-* are stripped in Caddy (strip_forwarded)."
   echo
   echo "  server {"
   echo "    listen 8080;"
@@ -454,9 +450,7 @@ log "Writing nginx.conf"
     echo "      gzip_types text/yaml application/x-yaml application/yaml text/plain;"
   }
 
-  # Raw settings, shared by the raw locations and @follow_redirect. Nexus's
-  # contentMaxAge=0: check upstream on every request, and serve the cached copy
-  # when that fails. Upstream cache headers are ignored so they cannot turn it off.
+  # Raw settings, shared by the raw locations and @follow_redirect.
   raw_policy() {
     echo "      proxy_cache content;"
     echo "      proxy_ignore_headers Cache-Control Expires Set-Cookie X-Accel-Expires"
@@ -470,7 +464,7 @@ log "Writing nginx.conf"
     echo "      proxy_connect_timeout 5s;"
     echo "      # Also how long a hung upstream delays the stale copy."
     echo "      proxy_read_timeout 30s;"
-    echo "      # Bounds retries across hosts with several IPs; does not shorten a stalled read."
+    echo "      # Caps retries across a host's IPs."
     echo "      proxy_next_upstream_tries 2;"
     echo "      proxy_next_upstream_timeout 10s;"
     echo "      proxy_intercept_errors on;"
@@ -662,7 +656,7 @@ log "Writing Caddyfile"
   # public CDNs being fetched as an ordinary client, which is what Nexus did.
   # packages.buildkite.com is the proof -- it answers a request carrying
   # X-Forwarded-Host with a 301 to its marketing site instead of the signed CDN
-  # URL for the key. Strip them here: nginx passes client headers on to every hop.
+  # URL for the key. Strip them here: nginx forwards client headers upstream.
   #
   # Caddy logs "Unnecessary header_up X-Forwarded-Proto: the reverse proxy's
   # default behavior is to pass headers to the upstream" once per route on load.
@@ -921,13 +915,16 @@ else
   log "acng.conf unchanged"
 fi
 
-if [[ "$(cfg_sum "${STACK_DIR}/nginx.conf")" != "${NGINX_SUM_BEFORE}" ]]; then
-  log "nginx.conf changed, reloading content-cache"
-  docker compose exec -T content-cache sh -c 'nginx -t && nginx -s reload' \
-    || die "nginx would not load the new config. The previous one is still serving -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs content-cache"
-else
-  log "nginx.conf unchanged"
-fi
+# Reloaded every run, not on checksum change: a run that died after writing
+# nginx.conf would otherwise leave the old config serving. A just-started nginx
+# has no pid file yet, and reloading then fails.
+log "Reloading content-cache"
+for _ in $(seq 1 30); do
+  docker compose exec -T content-cache test -s /run/nginx.pid && break
+  sleep 1
+done
+docker compose exec -T content-cache sh -c 'nginx -t && nginx -s reload' \
+  || die "nginx would not load ${STACK_DIR}/nginx.conf -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs content-cache"
 
 # ---------------------------------------------------------------------------
 # Verify
@@ -1020,8 +1017,7 @@ else
   failed=$((failed + 1))
 fi
 
-# A signing key must be checked by content: a 200 can just as well be an HTML
-# page an upstream redirected to, which is how a broken buildkite key once passed.
+# Check keys by content: a redirect to an HTML page also returns 200.
 check_pgp(){ # label, url
   local label="$1" url="$2" body
   body="$(curl -fsS --max-time 45 "${url}" 2>/dev/null)" || body=""
@@ -1095,6 +1091,5 @@ fi
 
 cat <<EOF
 The caches start cold. That is expected and self-correcting; the first pull of
-anything is a miss and every one after it is not (raw paths still check
-upstream first, then serve the cached copy if it fails).
+anything is a miss; after that raw paths revalidate and fall back to the cache.
 EOF

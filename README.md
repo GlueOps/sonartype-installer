@@ -211,12 +211,15 @@ returns 200 from disk while a path that was never cached returns 504.
 
 **Raw revalidates on every request**, as `contentMaxAge: 0` did under Nexus:
 `proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
-served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
-back immediately, an unreachable upstream after 5s per address with no new
-attempt after 10s, and a hanging one after 30s (read timeout). The 10s only
-stops new attempts, so one started just before it can still run its full
-timeouts: the worst case is about 40s. Two cases get no cached copy: a redirect chain longer than 10
-hops (500), and a redirect target whose DNS fails (502).
+served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls back
+immediately, an unreachable upstream after 5s per address with no new attempt
+after 10s, and a hanging one after 30s (read timeout). The 10s only stops new
+attempts, so one started just before it can still run its full timeouts: the
+worst case is about 45s per redirect hop. The upstream blocks keep connections
+open (nginx 1.29.7+ default), so the first request after an upstream silently
+stops answering is sent on a pooled connection and waits the 30s read timeout
+rather than the 5s connect one. Two cases get no cached copy: a redirect chain
+longer than 10 hops (500), and a redirect target whose DNS fails (502).
 
 **Upstreams resolve IPv4 only.** Each helm and raw host is an `upstream` block
 with `server <host>:443 resolve`, looked up through Docker's DNS with

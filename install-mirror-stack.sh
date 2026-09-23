@@ -392,16 +392,9 @@ log "Writing nginx.conf"
   echo "  proxy_cache_background_update on;"
   echo "  proxy_cache_revalidate on;"
   echo
-  echo "  # The outage behaviour this whole component exists for: if the upstream"
-  echo "  # errors, times out or 5xxes, serve what we already have."
-  echo "  proxy_cache_use_stale error timeout updating"
-  echo "                        http_500 http_502 http_503 http_504 http_429;"
-  echo
   echo "  proxy_ssl_server_name on;"
   echo "  proxy_ssl_protocols TLSv1.2 TLSv1.3;"
   echo "  proxy_http_version 1.1;"
-  echo "  proxy_connect_timeout 15s;"
-  echo "  proxy_read_timeout 300s;"
   echo "  proxy_send_timeout 300s;"
   echo "  proxy_buffering on;"
   echo "  # GitHub's 302 to its asset CDN carries a signed URL hundreds of bytes"
@@ -427,10 +420,28 @@ log "Writing nginx.conf"
   echo "    location = /healthz { return 200 \"ok\\n\"; }"
   echo
 
+  # The outage behaviour this component exists for, shared by helm and raw:
+  # serve what we have when the upstream fails, whatever its cache headers say.
+  # $1: extra headers to ignore.
+  cache_resilience() {
+    echo "      proxy_ignore_headers Cache-Control Expires Set-Cookie X-Accel-Expires"
+    echo "                           X-Accel-Redirect X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset${1:+ $1};"
+    echo "      proxy_hide_header Set-Cookie;"
+    echo "      proxy_cache_use_stale error timeout invalid_header updating"
+    echo "                            http_500 http_502 http_503 http_504 http_429 http_403 http_404;"
+    echo "      proxy_connect_timeout 5s;"
+    echo "      proxy_read_timeout 30s;"
+    echo "      # Caps retries across a host's IPs."
+    echo "      proxy_next_upstream_tries 2;"
+    echo "      proxy_next_upstream_timeout 10s;"
+  }
+
   # Helm settings, shared by the helm locations and @follow_redirect_helm: a
   # named location inherits nothing from the location that jumped to it.
   helm_policy() {
     echo "      proxy_cache content;"
+    # Vary is safe to ignore only because Accept-Encoding is cleared below.
+    cache_resilience Vary
     echo "      # An index moves; a chart tarball at a version does not."
     echo "      proxy_cache_valid 200 206 5m;"
     echo "      proxy_intercept_errors on;"
@@ -453,20 +464,11 @@ log "Writing nginx.conf"
   # Raw settings, shared by the raw locations and @follow_redirect.
   raw_policy() {
     echo "      proxy_cache content;"
-    echo "      proxy_ignore_headers Cache-Control Expires Set-Cookie X-Accel-Expires"
-    echo "                           X-Accel-Redirect X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset;"
-    echo "      proxy_hide_header Set-Cookie;"
+    cache_resilience
     echo "      # Must stay above 0: 0 means \"do not cache\"."
     echo "      proxy_cache_valid 200 206 1s;"
+    echo "      # The client waits for the check, so a hung upstream delays it up to 30s."
     echo "      proxy_cache_background_update off;"
-    echo "      proxy_cache_use_stale error timeout invalid_header updating"
-    echo "                            http_500 http_502 http_503 http_504 http_429 http_403 http_404;"
-    echo "      proxy_connect_timeout 5s;"
-    echo "      # Also how long a hung upstream delays the stale copy."
-    echo "      proxy_read_timeout 30s;"
-    echo "      # Caps retries across a host's IPs."
-    echo "      proxy_next_upstream_tries 2;"
-    echo "      proxy_next_upstream_timeout 10s;"
     echo "      proxy_intercept_errors on;"
     echo "      error_page 301 302 303 307 308 = @follow_redirect;"
   }

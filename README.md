@@ -187,8 +187,14 @@ returns 200 from disk while a path that was never cached returns 504.
 `proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
 served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
 back immediately, an unreachable upstream after 5–10s (connect timeout, one
-retry), and a hanging one after 30s (read timeout). Two cases get no cached copy: a redirect chain longer than 10 hops
-(500), and a redirect target whose DNS fails (502).
+retry), and a hanging one after 30s (read timeout). Two cases get no cached
+copy: a redirect chain longer than 10 hops (500), and a redirect target whose DNS
+fails (502).
+
+**Helm indexes get the same fallback and header handling** (`cache_resilience`),
+but keep a 5-minute lifetime (previously 10 where upstream sent `max-age=600`) and
+refresh in the background, so an expired index is served at once and no client
+waits on the upstream.
 
 Two settings that are not optional. `proxy_buffer_size 32k` — GitHub's 302
 carries a signed URL long enough that the default 4k buffer fails the request as

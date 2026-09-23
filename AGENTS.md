@@ -109,8 +109,10 @@ index serves gzip when asked), `proxy_buffer_size 32k` (GitHub's 302 carries a
 signed URL that overflows the 4k default and fails as "upstream sent too big
 header"), and `proxy_max_temp_file_size` being non-zero (nginx stages a response
 in a temp file on its way into the cache). For raw, keep `proxy_cache_valid`
-above 0 (0 means "don't cache") and keep `proxy_ignore_headers`, or an upstream's
-`Cache-Control` decides whether the outage fallback exists. Keep the server-level
+above 0 (0 means "don't cache"). For raw and Helm, keep `proxy_ignore_headers`
+(`cache_resilience`), or an upstream's `Cache-Control` decides whether the outage
+fallback exists. Helm also ignores `Vary`, which is safe only because it clears
+`Accept-Encoding`; raw passes it through and must not. Keep the server-level
 `recursive_error_pages on`: without it hop 2 of a redirect reaches the client as
 a 302. nginx caps chains at 10 hops and answers 500 beyond that.
 

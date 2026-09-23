@@ -51,6 +51,32 @@ Every cache is plain local disk. Upstream is explicit that a pull-through
 registry cache uses the `filesystem` storage driver; helm and raw cache in
 `nginx:alpine` behind Caddy, which stays the stock `caddy:2` image.
 
+### Retention
+
+| layer | setting | effect |
+| --- | --- | --- |
+| apt-cacher-ng | `ExThreshold: 45` | 45 days before an unreferenced file is expired |
+| nginx (raw) | always revalidate, stale on error | those are stable paths whose *content moves* |
+| nginx (helm index) | `5m` | an index is the thing that moves |
+| nginx (eviction) | `inactive=365d` + `max_size` | LRU, disk pressure only |
+| registries | `REGISTRY_PROXY_TTL=0` | never deleted |
+
+The packaged apt-cacher-ng default is `ExThreshold: 4`, and its own docs warn
+that a low value plus an index unavailable for a few days risks deleting
+still-useful package files — a mirror outage being precisely the case this cache
+exists for. At 45 an outage has to last six weeks before the cache erodes.
+
+Retention is not freshness. Raising the *freshness* window on raw would be a
+regression: `dl.k8s.io/release/stable.txt` and friends are stable paths whose
+content moves, which is why they revalidate on every request.
+
+**`Offlinemode` is not a retention setting and must not be left on.** It forbids
+outgoing connections entirely: indexes never refresh, security updates never
+arrive, and any package not already cached returns 503 — verified against a
+*healthy* upstream, not just an unreachable one. apt-cacher-ng has no
+stale-on-error fallback; this is a mode switch, not a policy. If you want it
+during an incident, set it, restart `apt-cache`, and **unset it afterwards**.
+
 ### Nothing is stopped until everything is in hand
 
 Images are **built and pulled before the current stack is touched**. `docker

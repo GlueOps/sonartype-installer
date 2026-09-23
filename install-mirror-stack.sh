@@ -383,8 +383,8 @@ log "Writing nginx.conf"
   echo "                   ' [\$upstream_status] [\$upstream_bytes_received]';"
   echo "  access_log /var/log/nginx/access.log cache;"
   echo
-  echo "  # Docker's embedded DNS. Required because the redirect-following"
-  echo "  # location proxies to a hostname only known at request time."
+  echo "  # Docker's embedded DNS, for the redirect targets and the upstream blocks"
+  echo "  # below. ipv6=off: the compose network has no IPv6 route."
   echo "  resolver 127.0.0.11 ipv6=off valid=30s;"
   echo "  resolver_timeout 5s;"
   echo
@@ -419,6 +419,22 @@ log "Writing nginx.conf"
   echo
   echo "  # X-Forwarded-* are stripped in Caddy (strip_forwarded)."
   echo
+
+  # One upstream per host, named after it so proxy_pass https://<host>/ binds to
+  # it unchanged. A plain proxy_pass resolves once at startup through musl,
+  # which keeps AAAA records; resolve goes through the ipv6=off resolver instead.
+  upstream_hosts=()
+  for entry in "${HELM_REPOS[@]}" "${RAW_REPOS[@]}"; do
+    IFS=: read -r _ host _ <<<"${entry}"
+    [[ " ${upstream_hosts[*]} " == *" ${host} "* ]] || upstream_hosts+=("${host}")
+  done
+  for i in "${!upstream_hosts[@]}"; do
+    echo "  upstream ${upstream_hosts[$i]} {"
+    echo "    zone upstream_${i} 64k;"
+    echo "    server ${upstream_hosts[$i]}:443 resolve;"
+    echo "  }"
+  done
+  echo
   echo "  server {"
   echo "    listen 8080;"
   echo "    server_name _;"
@@ -439,8 +455,8 @@ log "Writing nginx.conf"
     echo "                            http_500 http_502 http_503 http_504 http_429 http_403 http_404;"
     echo "      proxy_connect_timeout 5s;"
     echo "      proxy_read_timeout 30s;"
-    echo "      # Caps retries across a host's IPs."
-    echo "      proxy_next_upstream_tries 2;"
+    echo "      # Stops new attempts after 10s. No tries cap: if a host resolves to an"
+    echo "      # unreachable address, a cap can end the request before a good one is tried."
     echo "      proxy_next_upstream_timeout 10s;"
   }
 

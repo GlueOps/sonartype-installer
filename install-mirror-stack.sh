@@ -439,8 +439,8 @@ log "Writing nginx.conf"
     echo "                            http_500 http_502 http_503 http_504 http_429 http_403 http_404;"
     echo "      proxy_connect_timeout 5s;"
     echo "      proxy_read_timeout 30s;"
-    echo "      # Caps retries across a host's IPs."
-    echo "      proxy_next_upstream_tries 2;"
+    echo "      # Bounds the walk across a host's addresses. No tries cap: the containers"
+    echo "      # have no IPv6 route, so AAAA addresses fail instantly and must be skipped."
     echo "      proxy_next_upstream_timeout 10s;"
   }
 

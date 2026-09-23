@@ -212,8 +212,8 @@ returns 200 from disk while a path that was never cached returns 504.
 **Raw revalidates on every request**, as `contentMaxAge: 0` did under Nexus:
 `proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
 served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
-back immediately, an unreachable upstream after 5–10s (connect timeout, one
-retry), and a hanging one after 30s (read timeout). Two cases get no cached
+back immediately, an unreachable upstream after 5–10s (connect timeout, 10s
+across all its addresses), and a hanging one after 30s (read timeout). Two cases get no cached
 copy: a redirect chain longer than 10 hops (500), and a redirect target whose DNS
 fails (502).
 

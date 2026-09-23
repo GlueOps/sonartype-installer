@@ -212,10 +212,18 @@ returns 200 from disk while a path that was never cached returns 504.
 **Raw revalidates on every request**, as `contentMaxAge: 0` did under Nexus:
 `proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
 served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
-back immediately, an unreachable upstream after 5–10s (connect timeout, 10s
-across all its addresses), and a hanging one after 30s (read timeout). Two cases get no cached
-copy: a redirect chain longer than 10 hops (500), and a redirect target whose DNS
-fails (502).
+back immediately, an unreachable upstream after 5s per address with no new
+attempt after 10s, and a hanging one after 30s (read timeout). The 10s only
+stops new attempts, so one started just before it can still run its full
+timeouts: the worst case is about 40s. Two cases get no cached copy: a redirect chain longer than 10
+hops (500), and a redirect target whose DNS fails (502).
+
+**Upstreams resolve IPv4 only.** Each helm and raw host is an `upstream` block
+with `server <host>:443 resolve`, looked up through Docker's DNS with
+`ipv6=off` and re-resolved every 30s. A plain `proxy_pass` hostname is resolved
+once at startup by musl, which keeps AAAA records whenever `::1` exists, and the
+compose network has no IPv6 route: nginx then tried unreachable IPv6 addresses
+first. The stack assumes an IPv4-only compose network.
 
 **Helm indexes get the same fallback and header handling** (`cache_resilience`),
 but keep a 5-minute lifetime (previously 10 where upstream sent `max-age=600`) and

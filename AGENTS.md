@@ -114,9 +114,15 @@ above 0 (0 means "don't cache"). For raw and Helm, keep `proxy_ignore_headers`
 fallback exists. Helm also ignores `Vary`, which is safe only because it clears
 `Accept-Encoding`; raw passes it through and must not. Keep the server-level
 `recursive_error_pages on`: without it hop 2 of a redirect reaches the client as
-a 302. nginx caps chains at 10 hops and answers 500 beyond that. Do not add
-`proxy_next_upstream_tries`: upstream names resolve to AAAA addresses too, the
-containers have no IPv6 route, and a cap lets two IPv6 misses become a 502.
+a 302. nginx caps chains at 10 hops and answers 500 beyond that.
+
+**Every helm and raw host needs its `upstream … resolve` block.** A `proxy_pass`
+to a bare hostname is resolved at startup by musl, which keeps AAAA records; the
+compose network may have no IPv6 route, so those attempts fail. The generated
+blocks resolve through `resolver … ipv6=off`, and adding a repository to
+`HELM_REPOS`/`RAW_REPOS` adds its block. Do not add `proxy_next_upstream_tries`:
+if a host ever resolves to unreachable addresses, a cap lets consecutive misses
+end the request before a reachable address is tried.
 
 **Docker Hub needs the `library/` rewrite.** Official images live under
 `library/` and the docker daemon only adds that prefix when talking to Hub

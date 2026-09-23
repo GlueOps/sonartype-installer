@@ -39,7 +39,7 @@ sudo BASE_DOMAIN=repo.example.com \
 | --- | --- |
 | 27 apt proxy repositories | apt-cacher-ng, **12** `Remap` entries |
 | 7 docker proxy repositories | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
-| 4 helm + 6 raw proxy repositories | Caddy `reverse_proxy`, straight to the upstream |
+| 4 helm + 6 raw proxy repositories | nginx cache behind Caddy |
 | Nexus UI | a static index of what the host serves, plus `/healthz` |
 
 No admin user, no EULA, and no *Docker Bearer Token Realm* to switch on by hand
@@ -48,10 +48,8 @@ path convention, but apt-cacher-ng's `Remap` and Caddy's `handle_path` reproduce
 it verbatim, so no `sources.list` or `helm repo add` in your estate has to move.
 
 Every cache is plain local disk. Upstream is explicit that a pull-through
-registry cache uses the `filesystem` storage driver, and all six raw proxies ran
-`contentMaxAge=0` under Nexus — always revalidate — so a plain `reverse_proxy`
-is a faithful replacement and no HTTP cache module is needed. This runs the
-stock `caddy:2` image.
+registry cache uses the `filesystem` storage driver; helm and raw cache in
+`nginx:alpine` behind Caddy, which stays the stock `caddy:2` image.
 
 ### Nothing is stopped until everything is in hand
 
@@ -94,10 +92,10 @@ them apart: regional on ACME, global on the pre-issued wildcard.
 
 **`X-Forwarded-*` is stripped from helm and raw upstream requests.** Those are
 third-party CDNs being fetched as an ordinary client, which is what Nexus did.
-`packages.buildkite.com` is the proof: it answers any request carrying an
-`X-Forwarded-Proto` with a 301 to its marketing site instead of the signed URL
-for the signing key — whether the value says `http` or `https`. The registry and
-apt routes keep their headers; those backends are yours.
+`packages.buildkite.com` is the proof: it answers a request carrying
+`X-Forwarded-Host` with a 301 to its marketing site instead of the signed URL
+for the signing key. The registry and apt routes keep their headers; those
+backends are yours.
 
 ### Registries run `ghcr.io/glueops/registry`
 
@@ -175,7 +173,8 @@ compressed body** — without it the rewrite silently does nothing at all.
 `packages.buildkite.com` all answer a download with a 302 to a CDN. Handing that
 back means the client needs its own egress, nothing is cached, and an outage is
 a hard failure. nginx follows them with `proxy_intercept_errors` and a named
-location. The cache key stays the **original request path**: buildkite's
+location, for chains of up to 10 hops. The cache key stays the **original
+request path**: buildkite's
 CloudFront URLs are signed and expiring, and GitHub's asset CDN hostname has
 already changed once, so keying on the target would never hit.
 
@@ -183,6 +182,19 @@ already changed once, so keying on the target would never hit.
 http_5xx` is the point of the whole component. Verified: with an entry's TTL
 expired and the upstream resolving to an unroutable address, a cached path
 returns 200 from disk while a path that was never cached returns 504.
+
+**Raw revalidates on every request**, as `contentMaxAge: 0` did under Nexus:
+`proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
+served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
+back immediately, an unreachable upstream after 5–10s (connect timeout, one
+retry), and a hanging one after 30s (read timeout). Two cases get no cached
+copy: a redirect chain longer than 10 hops (500), and a redirect target whose DNS
+fails (502).
+
+**Helm indexes get the same fallback and header handling** (`cache_resilience`),
+but keep a 5-minute lifetime (previously 10 where upstream sent `max-age=600`) and
+refresh in the background, so an expired index is served at once and no client
+waits on the upstream.
 
 Two settings that are not optional. `proxy_buffer_size 32k` — GitHub's 302
 carries a signed URL long enough that the default 4k buffer fails the request as
@@ -300,6 +312,9 @@ request and serves the cache on a `304` — every upstream here supports that,
 including `pkgs.k8s.io` via its CDN redirect. It also serves the cache when
 revalidation fails outright, so an unreachable or erroring upstream degrades to
 the cached copy rather than to an error.
+
+`install-mirror-stack.sh` reproduces this in nginx; see *Raw revalidates on
+every request* above.
 
 ### Changing a repository that already exists
 

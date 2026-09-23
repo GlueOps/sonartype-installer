@@ -64,20 +64,22 @@ itself.
 directive applies to every address on its block, so merging them serves the
 regional names a certificate that does not match. Keep them in separate blocks.
 
-**Do not remove the `header_up -X-Forwarded-*` lines.** Caddy logs
+**Do not remove the `header_up -X-Forwarded-*` lines** in `strip_forwarded`.
+Caddy logs
 `Unnecessary header_up X-Forwarded-Proto` once per stripped route. That warning
 is wrong: it matches the header name without noticing the leading `-` that makes
 it a deletion. Verified against a controlled upstream that all three headers
 arrive on an unmodified route and none arrives on a stripped one. Remove them
-and `packages.buildkite.com` silently starts answering 301 to its marketing site
-instead of the signed URL for its signing key.
+and `packages.buildkite.com` answers 301 to its marketing site instead of the
+signed URL for its signing key — `X-Forwarded-Host` is the trigger. Strip them in
+Caddy, not nginx: a location-level `proxy_set_header` drops the http-level list.
 
 **`docker compose up -d` does not apply a changed config file.** It recreates a
 container when the *service definition* changes — image, environment, volume
 list — not when the contents of a bind-mounted file change. A run that rewrites
 only the Caddyfile brings up nothing and leaves the old config serving. The
-script checksums both config files and reloads or restarts only what changed;
-keep that if you touch this area.
+script checksums the Caddyfile and acng.conf and reloads or restarts only what
+changed, and reloads nginx on every run; keep that if you touch this area.
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
 answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests
@@ -106,7 +108,13 @@ Accept-Encoding "";` (sub_filter cannot touch a gzipped body, and every chart
 index serves gzip when asked), `proxy_buffer_size 32k` (GitHub's 302 carries a
 signed URL that overflows the 4k default and fails as "upstream sent too big
 header"), and `proxy_max_temp_file_size` being non-zero (nginx stages a response
-in a temp file on its way into the cache).
+in a temp file on its way into the cache). For raw, keep `proxy_cache_valid`
+above 0 (0 means "don't cache"). For raw and Helm, keep `proxy_ignore_headers`
+(`cache_resilience`), or an upstream's `Cache-Control` decides whether the outage
+fallback exists. Helm also ignores `Vary`, which is safe only because it clears
+`Accept-Encoding`; raw passes it through and must not. Keep the server-level
+`recursive_error_pages on`: without it hop 2 of a redirect reaches the client as
+a 302. nginx caps chains at 10 hops and answers 500 beyond that.
 
 **Docker Hub needs the `library/` rewrite.** Official images live under
 `library/` and the docker daemon only adds that prefix when talking to Hub

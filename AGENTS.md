@@ -128,6 +128,12 @@ missing images after the teardown, which turns a registry problem into an
 outage. A public image refused with `denied` on a host means that host is
 sending a stale credential instead of pulling anonymously.
 
+**`Offlinemode: 1` freezes the apt mirror.** It forbids outgoing connections
+outright — no index refresh, no security updates, 503 for anything not already
+cached, even with a healthy upstream. It is an incident lever, never a default.
+apt-cacher-ng has no stale-on-error fallback; retention is `ExThreshold`, which
+is a different thing from freshness.
+
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and
 under `set -e` a failing probe kills the whole script silently. Write

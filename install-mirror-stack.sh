@@ -316,7 +316,15 @@ BindAddress: 0.0.0.0
 ForwardBtsSoap: 0
 PassThroughPattern: ^$
 
-ExThreshold: 24
+# Days an unreferenced file survives before expiry deletes it. The packaged
+# default is 4, which is dangerous here: the upstream docs warn that if an index
+# is unavailable for a few days -- a mirror outage, exactly the case this cache
+# exists for -- still-useful package files get removed. 45 days means an outage
+# has to last six weeks before the cache starts eroding.
+#
+# Retention, not freshness. Raw is always-revalidate and the helm index is five
+# minutes; both are correct and neither belongs here.
+ExThreshold: 45
 VerboseLog: 1
 ReportPage: acng-report.html
 

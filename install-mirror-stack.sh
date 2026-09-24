@@ -606,8 +606,7 @@ NGINX
 log "Writing nginx.conf"
 {
   echo "worker_processes auto;"
-  # stderr, not a file: the reload check reads [emerg] from the container log.
-  echo "error_log stderr warn;"
+  echo "error_log /var/log/nginx/error.log warn;"
   echo "events { worker_connections 2048; }"
   echo "http {"
   echo "  include /etc/nginx/mime.types;"
@@ -1068,7 +1067,6 @@ compose_logging() {
   echo "    image: ${NGINX_IMAGE}"
   echo "    container_name: content-cache"
   echo "    restart: unless-stopped"
-  compose_logging
   echo "    volumes:"
   echo "      - ${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro"
   echo "      - ${STACK_DIR}/content-cache:/var/cache/nginx"
@@ -1196,44 +1194,18 @@ done
 docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force \
   || die "Caddy would not load the new config -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs caddy"
 
-wait_healthz() { # service, port
+# Reloaded every run, not on checksum change: a run that died after writing a
+# config would otherwise leave the old one serving. A just-started nginx has no
+# pid file yet, and reloading then fails.
+for svc in apt-nginx content-cache; do
+  log "Reloading ${svc}"
   for _ in $(seq 1 30); do
-    docker compose exec -T "$1" wget -qO- "http://127.0.0.1:$2/healthz" >/dev/null 2>&1 && return 0
+    docker compose exec -T "${svc}" test -s /run/nginx.pid && break
     sleep 1
   done
-  die "$1 is not answering -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs $1"
-}
-
-# `nginx -t` passes some changes the running master then refuses on reload -- a
-# cache zone's path or levels= -- and that refusal only shows as [emerg] in its
-# log while the old config keeps serving. So read the log, and restart once when
-# it appears. The log is read into a variable first: under pipefail,
-# `logs | grep -q` loses the match to SIGPIPE.
-nginx_apply() { # service, port
-  local svc="$1" port="$2" out since
-  [[ -n "$(docker compose ps --status running -q "${svc}")" ]] || docker compose up -d --force-recreate "${svc}"
-  wait_healthz "${svc}" "${port}"
-  if ! out="$(docker compose exec -T "${svc}" nginx -t 2>&1)"; then
-    echo "${out}" >&2
-    die "${svc} rejected its new config; the previous one is still serving.
-The rejected file is already on disk, so do not restart ${svc} until a run succeeds."
-  fi
-  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  docker compose exec -T "${svc}" nginx -s reload
-  sleep 2
-  out="$(docker compose logs --no-color --no-log-prefix --since "${since}" "${svc}" 2>&1)" || out=""
-  if grep -Eq '^[0-9/]{10} [0-9:]{8} \[emerg\]' <<<"${out}"; then
-    grep -E '\[emerg\]' <<<"${out}" >&2 || true
-    log "${svc} refused the reload; restarting it"
-    docker compose restart "${svc}"
-    wait_healthz "${svc}" "${port}"
-  fi
-}
-
-log "Applying apt-nginx.conf"
-nginx_apply apt-nginx 3142
-log "Applying nginx.conf"
-nginx_apply content-cache 8080
+  docker compose exec -T "${svc}" sh -c 'nginx -t && nginx -s reload' \
+    || die "${svc} would not load its config -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs ${svc}"
+done
 
 # ---------------------------------------------------------------------------
 # Verify

@@ -90,11 +90,10 @@ config serving on every rerun. Write config files in place (`> file`); `cp`,
 `mv` or `sed -i` replace the inode and the running container keeps the old one.
 
 **`nginx -t` passing does not mean the reload worked.** A changed cache zone
-(`levels=`, path) passes `nginx -t`, and the running master then refuses the
-reload with `[emerg]` in its log while the old config keeps serving.
-`nginx_apply` reads the log for that and restarts once. Read `docker compose
-logs` into a variable before grepping: `logs | grep -q` under `pipefail` loses
-the match to SIGPIPE and reports success.
+(`levels=`, path, zone name) passes `nginx -t`, and the running master then
+refuses the reload with `[emerg]` in its log while the old config keeps serving.
+The script only reloads, so after such a change run `docker compose restart
+<service>` by hand.
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
 answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests

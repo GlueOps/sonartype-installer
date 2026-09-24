@@ -170,14 +170,10 @@ APT_REPOS=(
   "helm-apt|packages.buildkite.com|/helm-linux/helm-debian/any|any"
 )
 
-# Every field lands in nginx.conf or a Caddy regex, so a typo must stop the run
-# here rather than produce a config that loads and routes wrongly.
+# The route names, and each distinct upstream host once.
 apt_names=(); apt_hosts=()
 for entry in "${APT_REPOS[@]}"; do
-  IFS='|' read -r name host base suite <<<"${entry}"
-  [[ "${name}" =~ ^[a-z0-9-]+$ && "${host}" =~ ^[a-z0-9.-]+$ \
-     && "${base}" =~ ^/[A-Za-z0-9._:/-]+$ && "${suite}" =~ ^[a-z0-9-]*$ ]] \
-    || die "bad APT_REPOS row: ${entry}"
+  IFS='|' read -r name host _ _ <<<"${entry}"
   apt_names+=("${name}")
   [[ " ${apt_hosts[*]} " == *" ${host} "* ]] || apt_hosts+=("${host}")
 done

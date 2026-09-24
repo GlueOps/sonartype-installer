@@ -10,13 +10,15 @@ Two standalone installers. Neither imports the other; both generate a
 
 | Script | Builds | Status |
 | --- | --- | --- |
-| `install-mirror-stack.sh` | apt-cacher-ng + `ghcr.io/glueops/registry` + Caddy | current |
+| `install-mirror-stack.sh` | nginx (apt, helm, raw) + `ghcr.io/glueops/registry` + Caddy | current |
 | `install.sh` | Sonatype Nexus + Caddy | legacy — under a usage meter from 15 Oct 2026 |
 
 There is no build system, no test suite and no dependency manifest. A change is
-a change to one shell script.
+a change to one shell script. Keep `install-mirror-stack.sh` self-contained:
+hosts download that one file by tag and checksum, so a config file next to it
+would never reach them.
 
-## CI will reject you for two things
+## CI will reject you for three things
 
 **`shellcheck --severity=warning`** runs against both scripts. Run it before
 pushing:
@@ -31,6 +33,11 @@ the PR title. A correctly titled PR with a plainly worded commit still fails.
 Use `feat:`, `fix:`, `docs:`, `ci:`, `chore:`. If you have already committed
 without a prefix, `git reset --soft` to the base and recommit rather than adding
 a fixup.
+
+**The `dry-run` job** generates both shapes with `DRY_RUN=1`, then runs `nginx -t`
+on both nginx configs offline, `caddy validate` and `docker compose config`. A
+bare-hostname `proxy_pass` without an `upstream … resolve` block fails there,
+because the job has no DNS.
 
 ## How to verify a change without a server
 
@@ -76,10 +83,18 @@ Caddy, not nginx: a location-level `proxy_set_header` drops the http-level list.
 
 **`docker compose up -d` does not apply a changed config file.** It recreates a
 container when the *service definition* changes — image, environment, volume
-list — not when the contents of a bind-mounted file change. A run that rewrites
-only the Caddyfile brings up nothing and leaves the old config serving. The
-script checksums the Caddyfile and acng.conf and reloads or restarts only what
-changed, and reloads nginx on every run; keep that if you touch this area.
+list — not when the contents of a bind-mounted file change. So the script
+reloads Caddy and both nginx containers on every run, not when a checksum
+changes: a run that died after writing a file would otherwise leave the old
+config serving on every rerun. Write config files in place (`> file`); `cp`,
+`mv` or `sed -i` replace the inode and the running container keeps the old one.
+
+**`nginx -t` passing does not mean the reload worked.** A changed cache zone
+(`levels=`, path) passes `nginx -t`, and the running master then refuses the
+reload with `[emerg]` in its log while the old config keeps serving.
+`nginx_apply` reads the log for that and restarts once. Read `docker compose
+logs` into a variable before grepping: `logs | grep -q` under `pipefail` loses
+the match to SIGPIPE and reports success.
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
 answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests
@@ -131,16 +146,49 @@ directly, so a mirror hostname must rewrite single-segment repository names.
 change for different reasons, and those records are colon separated while a URL
 contains `://`, so a field added after the upstream gets a fragment of it.
 
-**Build and pull before stopping anything.** `docker compose up` fetches
+**Pull before stopping anything.** `docker compose up` fetches
 missing images after the teardown, which turns a registry problem into an
 outage. A public image refused with `denied` on a host means that host is
 sending a stale credential instead of pulling anonymously.
 
-**`Offlinemode: 1` freezes the apt mirror.** It forbids outgoing connections
-outright — no index refresh, no security updates, 503 for anything not already
-cached, even with a healthy upstream. It is an incident lever, never a default.
-apt-cacher-ng has no stale-on-error fallback; retention is `ExThreshold`, which
-is a different thing from freshness.
+**apt-nginx.conf is tested as a whole; change it as little as possible.** It is
+written from quoted heredocs so nginx's `$variables` stay literal; only the
+`APT_REPOS` rows and the two sizes are generated, with constant `printf`
+formats (the config contains `%7[Ee]`). Every setting below was added after a
+test failed without it:
+
+- **Two tiers.** `slice` and redirect following (`error_page` to a named
+  location) must never share a server: a slice subrequest that follows a
+  redirect loses its `Range` and splices a whole body into the file.
+- **Mutable indexes: `valid 1s`, no `background_update`, no `updating` in
+  `proxy_cache_use_stale`.** With either, a publish hands apt a new `InRelease`
+  and an old `Packages`, and `apt-get update` fails with "File has unexpected
+  size" on every repository without by-hash (docker, kubernetes).
+- **`proxy_set_header If-None-Match ""`** on mutable indexes. With ETag
+  revalidation a lagging mirror answers 200 with an older file and replaces a
+  newer cached one; by date it answers 304.
+- **`keepalive_timeout 0` and hidden `Last-Modified`** on sliced locations. When a
+  slice's upstream fails mid-body, nginx carries on with the next slice and the
+  client gets a hole with a correct length (every version since 1.9.8). Closing
+  the connection makes Caddy abort, and without `Last-Modified` apt's automatic
+  retry fetches the whole file rather than resuming into the hole.
+- **Hidden `ETag`** on sliced locations, or one upstream ETag change breaks that
+  file permanently.
+- **`volatile` on `$apt_nocache`/`$apt_empty`.** Slice subrequests share the
+  parent's cached variables; without it an HTML or empty slice after the first
+  is cached for ten years.
+- **The redirect allow-list is an `if` in the named location, not a `map`.** A
+  map is evaluated once per request, so hop 2 would reuse hop 1's verdict.
+- **Timeouts are arithmetic, not taste.** Indexes must answer (fresh or stale)
+  inside apt's 30s; the fetch tier's `/idx/` read timeout is short enough for one
+  retry on another address inside the cache tier's 15s.
+- **A location-level `proxy_set_header` replaces the inherited list**, so every
+  location repeats `Connection ""` and `Accept-Encoding ""`.
+- **Caddy's `lb_retries 2` on the apt route** turns a killed worker's dropped
+  connection into a retry. Caddy's own 502 has no body, and apt treats a 5xx
+  without a body as final.
+- **Caddy needs `net.ipv4.tcp_tw_reuse=1`**: with `keepalive_timeout 0`, one fast
+  client can otherwise exhaust Caddy's ports and every apt request 502s.
 
 **`set -e` and command substitution.** `local code` and `code="$(cmd)"` as
 separate statements means the assignment carries the command's exit status, and
@@ -158,15 +206,17 @@ carries every architecture.
 
 ## Do not change client-facing URLs
 
-`/repository/<name>/` is a Nexus path convention that `Remap` and `handle_path`
-reproduce deliberately, so an existing estate can point at this installer
+`/repository/<name>/` is a Nexus path convention that the generated nginx and
+Caddy routes reproduce deliberately, so an existing estate can point at this installer
 without editing a single `sources.list` or `helm repo add`. Renaming a
 repository breaks every client silently — they get a 404, not an error that
 explains itself.
 
 ## Adding a repository
 
-See **Adding a repository** in `README.md`. The short version: each kind lives
-in one table near the top of `install-mirror-stack.sh`, and APT additionally
-needs a `Remap` line whose grouping decides whether the upstream's `pool/` is
-shared or duplicated on disk.
+Each kind lives in one table near the top of `install-mirror-stack.sh`. An APT
+row is `name|host|base path|suite` (empty suite for a flat repository such as
+kubernetes). Rows with the same host and base share one cache, which is what
+lets the `ubuntu-*` suites share a pool. A new host gets its own `upstream`
+block and allow-list entry automatically; an upstream that redirects anywhere
+other than `*.cloudfront.net` will be refused.

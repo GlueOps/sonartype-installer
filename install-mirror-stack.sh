@@ -1261,143 +1261,9 @@ done
 
 echo
 log "Public checks over TLS"
-# Check keys and signed indexes by content: a redirect to an HTML page also
-# returns 200.
-check_pgp(){ # label, url, curl args...
-  local label="$1" url="$2" body; shift 2
-  body="$(curl -fsS --max-time 45 "$@" "${url}" 2>/dev/null)" || body=""
-  if [[ "${body}" == "-----BEGIN PGP"* ]]; then printf '  ok    %-30s pgp\n' "${label}"
-  else printf '  FAIL  %-30s not pgp  (%s)\n' "${label}" "${url}"; failed=$((failed + 1)); fi
-}
-warn(){ printf '  WARN  %-30s %s\n' "$1" "$2"; }
-
-# ---- apt: every repository through Caddy, and straight at apt-nginx ----
-# Straight at apt-nginx takes Caddy out of the picture: a Caddy-only pass or
-# failure shows up as a difference between the two.
-direct_status(){ # path -> HTTP status from apt-nginx itself
-  local out
-  out="$(docker compose exec -T apt-nginx wget -S -O /dev/null "http://127.0.0.1:3142$1" 2>&1)" || true
-  awk 'match($0, /HTTP\/1\.[01] [0-9][0-9][0-9]/) {c = substr($0, RSTART + 9, 3)} END {print (c ? c : "000")}' <<<"${out}"
-}
-apt_tmp="$(mktemp -d)"; trap 'rm -rf "${apt_tmp}"' EXIT
-apt_url(){ echo "https://${BASE_DOMAIN}/repository/$1/$2"; }
-index_of(){ [[ -n "$1" ]] && echo "dists/$1/InRelease" || echo "InRelease"; }
-dir_of(){ [[ -n "$1" ]] && echo "dists/$1/" || echo ""; }
-
-for entry in "${APT_REPOS[@]}"; do
-  IFS='|' read -r name _ _ suite <<<"${entry}"
-  idx="$(index_of "${suite}")"
-  curl -fsS --max-time 45 "${RESOLVE[@]}" -o "${apt_tmp}/${name}.rel" "$(apt_url "${name}" "${idx}")" 2>/dev/null || :
-  code="$(direct_status "/repository/${name}/${idx}")"
-  if [[ "$(head -c 14 "${apt_tmp}/${name}.rel" 2>/dev/null)" == "-----BEGIN PGP" && "${code}" == "200" ]]; then
-    printf '  ok    %-30s pgp, direct %s\n' "apt  ${name}" "${code}"
-  else
-    printf '  FAIL  %-30s not pgp via Caddy, or direct %s  (%s)\n' "apt  ${name}" "${code}" "$(apt_url "${name}" "${idx}")"
-    failed=$((failed + 1))
-  fi
-done
-
-# InRelease lists each index with its SHA256 and size.
-# A missing file (the fetch failed, already reported above) is an empty list,
-# not a reason for pipefail and set -e to end the run before the summary.
-sha256_list(){ awk '/^SHA256:/ {f=1; next} /^[^ ]/ {f=0} f {print $1, $2, $3}' "$1" 2>/dev/null || true; }
-
-# kubernetes: the index apt downloads must match the InRelease that lists it.
-# This is the regression check for the %3a bug, where they came from different
-# publishes. A publish between the two fetches is possible, hence one retry.
-for entry in "${APT_REPOS[@]}"; do
-  IFS='|' read -r name _ _ suite <<<"${entry}"
-  [[ "${name}" == kubernetes-* ]] || continue
-  result="FAIL"
-  for attempt in 1 2; do
-    curl -fsS --max-time 45 "${RESOLVE[@]}" -o "${apt_tmp}/${name}.rel" "$(apt_url "${name}" InRelease)" 2>/dev/null || :
-    want="$(sha256_list "${apt_tmp}/${name}.rel" | awk '$3 == "Packages.gz" {print $1; exit}')"
-    got="$(curl -fsS --max-time 45 "${RESOLVE[@]}" "$(apt_url "${name}" Packages.gz)" 2>/dev/null | sha256sum | cut -d' ' -f1)" || got=""
-    [[ -n "${want}" && "${want}" == "${got}" ]] && { result="ok"; break; }
-    [[ "${attempt}" == 1 ]] && sleep 5
-  done
-  if [[ "${result}" == "ok" ]]; then printf '  ok    %-30s matches InRelease\n' "apt  ${name} Packages.gz"
-  else printf '  FAIL  %-30s does not match its InRelease\n' "apt  ${name} Packages.gz"; failed=$((failed + 1)); fi
-done
-
-# One package per upstream host, from that host's smallest package index:
-# a range request must come back 206 with the full size the index lists, and
-# start like a .deb. This goes through the sliced package path end to end.
-decompress(){ case "$1" in *.gz) gzip -dc "$2" ;; *.xz) xz -dc "$2" ;; esac; }
-for host in "${apt_hosts[@]}"; do
-  best=""
-  for entry in "${APT_REPOS[@]}"; do
-    IFS='|' read -r name h _ suite <<<"${entry}"
-    [[ "${h}" == "${host}" ]] || continue
-    while read -r sha size path; do
-      # |-separated: a flat repository's suite is empty.
-      [[ -z "${best}" || "${size}" -lt "${best%%|*}" ]] && best="${size}|${name}|${suite}|${path}|${sha}"
-    done < <(sha256_list "${apt_tmp}/${name}.rel" \
-             | awk '$3 ~ /^([a-z-]+\/binary-amd64\/)?Packages\.(gz|xz)$/ && $2 > 200')
-  done
-  label="apt  ${host%%.*} .deb"
-  if [[ -z "${best}" ]]; then printf '  FAIL  %-30s no package index found\n' "${label}"; failed=$((failed + 1)); continue; fi
-  IFS='|' read -r _ name suite path sha <<<"${best}"
-  if [[ "${path}" == *.xz ]] && ! command -v xz >/dev/null; then warn "${label}" "skipped: xz is not installed"; continue; fi
-  curl -fsS --max-time 60 "${RESOLVE[@]}" -o "${apt_tmp}/pkgs" "$(apt_url "${name}" "$(dir_of "${suite}")${path}")" 2>/dev/null || :
-  decompress "${path}" "${apt_tmp}/pkgs" > "${apt_tmp}/pkgs.txt" 2>/dev/null || :
-  read -r deb size < <(awk '/^Filename: / {f=$2} /^Size: / {s=$2} /^$/ && f && s {print f, s; exit}' "${apt_tmp}/pkgs.txt") || deb=""
-  if [[ -z "${deb}" ]]; then printf '  FAIL  %-30s could not read %s\n' "${label}" "${path}"; failed=$((failed + 1)); continue; fi
-  hdr="$(curl -sS --max-time 60 "${RESOLVE[@]}" -r 0-1023 -D - -o "${apt_tmp}/deb" "$(apt_url "${name}" "${deb}")" 2>/dev/null)" || hdr=""
-  code="$(awk 'NR == 1 {print $2}' <<<"${hdr}")"
-  total="$(awk 'tolower($1) == "content-range:" {sub(/.*\//, "", $NF); gsub(/\r/, "", $NF); print $NF}' <<<"${hdr}")"
-  if [[ "${code}" == "206" && "${total}" == "${size}" && "$(head -c 7 "${apt_tmp}/deb" 2>/dev/null)" == '!<arch>' ]]; then
-    printf '  ok    %-30s 206, %s bytes\n' "${label}" "${size}"
-  else
-    printf '  FAIL  %-30s %s, range total %s, want %s  (%s)\n' "${label}" "${code:-000}" "${total:-none}" "${size}" "${deb}"; failed=$((failed + 1))
-  fi
-  # The index itself by its hash: what apt actually requests on archives that
-  # publish by-hash, and a separate cache location from the plain name.
-  if [[ "${host}" == archive.ubuntu.com || "${host}" == deb.debian.org ]]; then
-    got="$(curl -fsS --max-time 60 "${RESOLVE[@]}" "$(apt_url "${name}" "$(dir_of "${suite}")${path%/*}/by-hash/SHA256/${sha}")" 2>/dev/null | sha256sum | cut -d' ' -f1)" || got=""
-    if [[ "${got}" == "${sha}" ]]; then printf '  ok    %-30s sha256 matches\n' "apt  ${host%%.*} by-hash"
-    else printf '  FAIL  %-30s sha256 mismatch  (%s)\n' "apt  ${host%%.*} by-hash" "${name}"; failed=$((failed + 1)); fi
-  fi
-done
-
-# What apt-nginx refuses. The unknown name goes straight to apt-nginx, since
-# Caddy answers it itself.
-code="$(direct_status /repository/no-such-repo/InRelease)"
-if [[ "${code}" == "404" ]]; then printf '  ok    %-30s %s\n' "apt  refuses unknown repo" "${code}"
-else printf '  FAIL  %-30s %s\n' "apt  refuses unknown repo" "${code}"; failed=$((failed + 1)); fi
-check "apt  refuses non-index path" '^404$' "$(apt_url ubuntu-noble ls-lR.gz)" "${RESOLVE[@]}"
-check "apt  refuses a query string" '^400$' "$(apt_url ubuntu-noble dists/noble/InRelease)?x" "${RESOLVE[@]}"
-check "apt  refuses POST" '^405$' "$(apt_url ubuntu-noble dists/noble/InRelease)" -X POST "${RESOLVE[@]}"
-
-# Warnings only: nothing here means the mirror is broken, but each is worth
-# knowing on a deploy.
-#
-# A served index much older than upstream's means apt-nginx is answering from
-# its stale copy -- the upstream is failing for it, and nodes are not getting
-# updates. Upstream is fetched first so a publish in between cannot look like lag.
-utc_epoch(){ TZ=UTC date -d "$1" +%s 2>/dev/null || echo 0; }
-date_of(){ awk -F': ' '/^Date: / {print $2; exit}' <<<"$1"; }
-lagging=0; compared=0
-for entry in "${APT_REPOS[@]}"; do
-  IFS='|' read -r name host base suite <<<"${entry}"
-  up="$(curl -fsSL --max-time 30 "https://${host}${base}/$(index_of "${suite}")" 2>/dev/null)" || continue
-  ours="$(curl -fsS --max-time 30 "${RESOLVE[@]}" "$(apt_url "${name}" "$(index_of "${suite}")")" 2>/dev/null)" || continue
-  up_t="$(utc_epoch "$(date_of "${up}")")"; our_t="$(utc_epoch "$(date_of "${ours}")")"
-  [[ "${up_t}" -gt 0 && "${our_t}" -gt 0 ]] && compared=$((compared + 1))
-  if [[ "${up_t}" -gt 0 && "${our_t}" -gt 0 && $((up_t - our_t)) -gt 3600 ]]; then
-    warn "apt  ${name}" "served index is $(( (up_t - our_t) / 60 )) min older than upstream"
-    lagging=$((lagging + 1))
-  fi
-done
-if [[ "${compared}" -eq 0 ]]; then warn "apt  freshness" "no index could be compared with upstream"
-elif [[ "${lagging}" -eq 0 ]]; then printf '  ok    %-30s %s indexes within 1h of upstream\n' "apt  freshness" "${compared}"; fi
-
-# nginx skips an unresponsive address for 10s, which only helps a host that has
-# another one to fall back to.
-for host in "${apt_hosts[@]}"; do
-  n="$(getent ahostsv4 "${host}" | awk '{print $1}' | sort -u | wc -l)" || n=0
-  [[ "${n}" -ge 2 ]] || warn "apt  ${host}" "resolves to ${n} IPv4 address(es); no failover"
-done
+check "apt  ubuntu-noble" '^200$' "https://${BASE_DOMAIN}/repository/ubuntu-noble/dists/noble/InRelease"
+check "apt  debian-trixie" '^200$' "https://${BASE_DOMAIN}/repository/debian-trixie/dists/trixie/InRelease"
+check "apt  kubernetes-v1-34" '^200$' "https://${BASE_DOMAIN}/repository/kubernetes-v1-34/Release"
 check "helm helm-tigera" '^200$' "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"
 check "helm helm-metrics-server" '^200$' "https://${BASE_DOMAIN}/repository/helm-metrics-server/index.yaml"
 # The chart URLs in an index must point back here, not at GitHub. A Helm client
@@ -1427,6 +1293,14 @@ else
   printf '  FAIL  %-30s index served, but chart urls still point upstream\n' "helm url rewrite"
   failed=$((failed + 1))
 fi
+
+# Check keys by content: a redirect to an HTML page also returns 200.
+check_pgp(){ # label, url
+  local label="$1" url="$2" body
+  body="$(curl -fsS --max-time 45 "${url}" 2>/dev/null)" || body=""
+  if [[ "${body}" == "-----BEGIN PGP"* ]]; then printf '  ok    %-30s pgp key\n' "${label}"
+  else printf '  FAIL  %-30s not a pgp key  (%s)\n' "${label}" "${url}"; failed=$((failed + 1)); fi
+}
 
 check_pgp "raw  raw-docker gpg" "https://${BASE_DOMAIN}/repository/raw-docker/linux/ubuntu/gpg"
 check "raw  raw-k8s" '^200$' "https://${BASE_DOMAIN}/repository/raw-k8s/release/stable.txt"

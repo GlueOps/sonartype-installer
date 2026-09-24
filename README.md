@@ -234,10 +234,6 @@ Runbooks:
   `Acquire::Check-Valid-Until "false";` in `/etc/apt/apt.conf.d/`, removed afterwards.
 - **A new Kubernetes minor.** Add its row to `APT_REPOS` and re-run.
 
-The post-deploy checks compare each served `InRelease` with upstream's and warn
-when the mirror is more than an hour behind: that is how a cache stuck on its
-stale copy shows up.
-
 ### Helm and raw go through nginx
 
 Caddy fronts everything and terminates TLS. Behind it, nginx does the three

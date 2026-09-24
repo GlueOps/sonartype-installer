@@ -15,14 +15,14 @@
 # the Nexus stack, and is kept for deployments that stay under the limits.
 #
 # WHAT IT BUILDS
-#   27 apt suites       -> apt-cacher-ng, 12 Remap entries
+#   27 apt suites       -> nginx (apt-nginx), 6 upstream hosts
 #    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
 #                          upstream (see REGISTRY_IMAGE)
 #    4 helm + 6 raw     -> nginx cache behind Caddy
 # No licence meter, no admin user, no EULA, no realm to switch on by hand.
 #
 # Every cache is plain local disk. Upstream is explicit that a pull-through
-# registry cache uses the filesystem storage driver; helm and raw cache in
+# registry cache uses the filesystem storage driver; apt, helm and raw cache in
 # nginx:alpine, so Caddy stays the stock caddy:2 image.
 #
 # MIGRATING FROM NEXUS
@@ -46,6 +46,9 @@
 #   STACK_DIR           default /opt/mirror-stack
 #   OLD_STACK_DIR       default /opt/nexus-stack
 #   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
+#   NGINX_IMAGE         nginx image for apt-nginx and content-cache, tag@digest
+#   APT_CACHE_MAX_SIZE  apt package cache ceiling, default 40g
+#   APT_CACHE_MIN_FREE  free disk the apt cache always leaves, default 10g
 #   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
 #   LOG_MAX_FILES       rotated log files kept per container, default 5
 #   DRY_RUN=1           generate the config files and stop
@@ -61,7 +64,13 @@ GLOBAL_BASE_DOMAIN="${GLOBAL_BASE_DOMAIN:-}"
 GLOBAL_CERT_NAME="${GLOBAL_CERT_NAME:-${GLOBAL_BASE_DOMAIN}}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 
-ACNG_UID="${ACNG_UID:-8142}"
+# apt-nginx and content-cache. Pinned: the apt config is tested against this
+# version, and `resolve` in upstream blocks needs 1.27.3+.
+NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.31.6-alpine@sha256:d10753d9289b8e3f884386351f73554ce72b631378949deddd75e83ee296c427}"
+# The apt package cache. min_free is what keeps it from filling a disk the
+# registries share: nginx evicts rather than write past it.
+APT_CACHE_MAX_SIZE="${APT_CACHE_MAX_SIZE:-40g}"
+APT_CACHE_MIN_FREE="${APT_CACHE_MIN_FREE:-10g}"
 # The helm and raw cache. Charts and release binaries are small next to
 # container layers; this is a ceiling, not an allocation.
 NGINX_CACHE_MAX_SIZE="${NGINX_CACHE_MAX_SIZE:-20g}"
@@ -78,6 +87,9 @@ log(){ echo "==> $*"; }
 BASE_DOMAIN="${1:-${BASE_DOMAIN:-}}"
 [[ -n "${BASE_DOMAIN}" ]] || die "BASE_DOMAIN is required (or pass the hostname as the first argument)"
 [[ -n "${ACME_EMAIL}" ]] || die "ACME_EMAIL is required"
+for v in APT_CACHE_MAX_SIZE APT_CACHE_MIN_FREE; do
+  [[ "${!v}" =~ ^[0-9]+[kKmMgG]$ ]] || die "${v}=${!v}: expected a number and a unit, e.g. 40g"
+done
 
 if [[ "${DRY_RUN}" != "1" ]]; then
   [[ "${EUID}" -eq 0 ]] || die "must run as root: sudo $0 ${BASE_DOMAIN}"
@@ -117,20 +129,58 @@ OFFICIAL_NAMESPACE=(
   "dockerhub:library"
 )
 
-# Everything apt-cacher-ng answers for. The Remap table inside acng.conf is what
-# maps these onto upstreams; Caddy only needs to know the set, to route it.
+# name|upstream host|upstream base path|suite -- served by apt-nginx over https.
+# The suite is only used by the post-deploy checks; empty means a flat
+# repository (InRelease next to Packages, no dists/).
+#
+# Prefixes that share a host and base share one cache: the nine ubuntu-*
+# repositories have one pool/, so a .deb fetched through one is a hit through
+# the others. debian-security is a separate archive with its own pool/.
+# kubernetes goes to prod-cdn.packages.k8s.io directly with literal colons:
+# pkgs.k8s.io only redirects there, and CloudFront keys its cache on the exact
+# spelling -- a percent-encoded %3a path was served month-old indexes.
+# packages.buildkite.com answers every path with a 302 to signed CloudFront.
 APT_REPOS=(
-  ubuntu-jammy ubuntu-jammy-updates ubuntu-jammy-security
-  ubuntu-noble ubuntu-noble-updates ubuntu-noble-security
-  ubuntu-resolute ubuntu-resolute-updates ubuntu-resolute-security
-  debian-bookworm debian-bookworm-updates debian-bookworm-security
-  debian-trixie debian-trixie-updates debian-trixie-security
-  kubernetes-v1-32 kubernetes-v1-33 kubernetes-v1-34
-  kubernetes-v1-35 kubernetes-v1-36 kubernetes-v1-37
-  docker-ubuntu-jammy docker-ubuntu-noble docker-ubuntu-resolute
-  docker-debian-bookworm docker-debian-trixie
-  helm-apt
+  "ubuntu-jammy|archive.ubuntu.com|/ubuntu|jammy"
+  "ubuntu-jammy-updates|archive.ubuntu.com|/ubuntu|jammy-updates"
+  "ubuntu-jammy-security|archive.ubuntu.com|/ubuntu|jammy-security"
+  "ubuntu-noble|archive.ubuntu.com|/ubuntu|noble"
+  "ubuntu-noble-updates|archive.ubuntu.com|/ubuntu|noble-updates"
+  "ubuntu-noble-security|archive.ubuntu.com|/ubuntu|noble-security"
+  "ubuntu-resolute|archive.ubuntu.com|/ubuntu|resolute"
+  "ubuntu-resolute-updates|archive.ubuntu.com|/ubuntu|resolute-updates"
+  "ubuntu-resolute-security|archive.ubuntu.com|/ubuntu|resolute-security"
+  "debian-bookworm|deb.debian.org|/debian|bookworm"
+  "debian-bookworm-updates|deb.debian.org|/debian|bookworm-updates"
+  "debian-bookworm-security|security.debian.org|/debian-security|bookworm-security"
+  "debian-trixie|deb.debian.org|/debian|trixie"
+  "debian-trixie-updates|deb.debian.org|/debian|trixie-updates"
+  "debian-trixie-security|security.debian.org|/debian-security|trixie-security"
+  "kubernetes-v1-32|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.32/deb|"
+  "kubernetes-v1-33|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.33/deb|"
+  "kubernetes-v1-34|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.34/deb|"
+  "kubernetes-v1-35|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.35/deb|"
+  "kubernetes-v1-36|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.36/deb|"
+  "kubernetes-v1-37|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.37/deb|"
+  "docker-ubuntu-jammy|download.docker.com|/linux/ubuntu|jammy"
+  "docker-ubuntu-noble|download.docker.com|/linux/ubuntu|noble"
+  "docker-ubuntu-resolute|download.docker.com|/linux/ubuntu|resolute"
+  "docker-debian-bookworm|download.docker.com|/linux/debian|bookworm"
+  "docker-debian-trixie|download.docker.com|/linux/debian|trixie"
+  "helm-apt|packages.buildkite.com|/helm-linux/helm-debian/any|any"
 )
+
+# Every field lands in nginx.conf or a Caddy regex, so a typo must stop the run
+# here rather than produce a config that loads and routes wrongly.
+apt_names=(); apt_hosts=()
+for entry in "${APT_REPOS[@]}"; do
+  IFS='|' read -r name host base suite <<<"${entry}"
+  [[ "${name}" =~ ^[a-z0-9-]+$ && "${host}" =~ ^[a-z0-9.-]+$ \
+     && "${base}" =~ ^/[A-Za-z0-9._:/-]+$ && "${suite}" =~ ^[a-z0-9-]*$ ]] \
+    || die "bad APT_REPOS row: ${entry}"
+  apt_names+=("${name}")
+  [[ " ${apt_hosts[*]} " == *" ${host} "* ]] || apt_hosts+=("${host}")
+done
 
 # name:upstream host:upstream path prefix
 # Helm chart repositories: an index.yaml plus .tgz files over plain HTTPS.
@@ -207,19 +257,8 @@ first, then retry. Nothing has been changed."
     -in "${CERT_SRC}/${GLOBAL_CERT_NAME}.crt" | cut -d= -f2)"
 fi
 
-# docker compose up -d recreates a container when its *service definition*
-# changes -- image, environment, the list of volumes. It does not notice that
-# the contents of a bind-mounted file changed, so a run that alters only the
-# Caddyfile or acng.conf brings up nothing and silently leaves the old config
-# serving. That has to be handled explicitly below, and it needs the old
-# checksums taken before anything is rewritten. nginx is reloaded every run.
-cfg_sum() { [[ -f "$1" ]] && sha256sum "$1" | cut -d" " -f1 || echo "absent"; }
-CADDY_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/Caddyfile")"
-ACNG_SUM_BEFORE="$(cfg_sum "${STACK_DIR}/acng.conf")"
-
-# A host with no room left fails deep inside `docker build`, as "You don't have
-# enough free space in /var/cache/apt/archives/" buried in a layer log -- which
-# reads like a broken Dockerfile rather than a full disk. Check first and say so.
+# A host with no room left fails deep inside an image pull or a cache write,
+# with an error that reads like anything but a full disk. Check first and say so.
 # This runs before anything is written and long before Nexus is stopped, and it
 # matters more now that a registry cache only grows.
 if [[ "${DRY_RUN}" != "1" ]]; then
@@ -231,7 +270,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
       df -h "${path}" >&2
       die "only ${free_mb}MB free on ${path}, need at least ${need_mb}MB.
 
-Building the images alone needs a few hundred MB, and a registry cache only
+Pulling the images alone needs a few hundred MB, and a registry cache only
 grows. Nothing has been changed and the current stack is still serving.
 
 To reclaim space:
@@ -245,7 +284,21 @@ thing on disk and is safe to remove once the new stack has proven itself:
 fi
 
 log "Preparing ${STACK_DIR}"
-mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-cache,apt-log,registries,content-cache,content-log}
+# First run with apt-nginx: its cache is new, and on an upgraded host the old
+# apt-cacher-ng cache (apt-cache/) is left in place, so say how much room there is.
+# min_free means nginx never fills the disk; with less room the cache just holds less.
+if [[ "${DRY_RUN}" != "1" && ! -d "${STACK_DIR}/apt-nginx-cache" && -d "$(dirname "${STACK_DIR}")" ]]; then
+  to_mb() { local n="${1%?}"; case "${1: -1}" in k|K) echo $((n / 1024)) ;; m|M) echo "${n}" ;; g|G) echo $((n * 1024)) ;; esac; }
+  want_mb=$(( $(to_mb "${APT_CACHE_MAX_SIZE}") + $(to_mb "${APT_CACHE_MIN_FREE}") ))
+  free_mb="$(df -Pm "$(dirname "${STACK_DIR}")" | awk 'NR==2 {print $4}')"
+  if [[ -n "${free_mb}" && "${free_mb}" -lt "${want_mb}" ]]; then
+    echo "    WARNING: ${free_mb}MB free, the apt cache can use up to ${APT_CACHE_MAX_SIZE} plus ${APT_CACHE_MIN_FREE} kept free."
+    [[ -d "${STACK_DIR}/apt-cache" ]] && \
+      echo "    The old apt-cacher-ng cache is no longer used: $(du -sh "${STACK_DIR}/apt-cache" 2>/dev/null | cut -f1) in ${STACK_DIR}/apt-cache"
+  fi
+fi
+
+mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-nginx-cache,registries,content-cache,content-log}
 mkdir -p "${STACK_DIR}/site"
 for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ _ _ <<<"${entry}"
@@ -253,8 +306,6 @@ for entry in "${REGISTRIES[@]}"; do
 done
 
 if [[ "${DRY_RUN}" != "1" ]]; then
-  chown -R "${ACNG_UID}:${ACNG_UID}" "${STACK_DIR}/apt-cache" "${STACK_DIR}/apt-log"
-
   # registry:2 left expiry state behind. With REGISTRY_PROXY_TTL=0 it's ignored, but
   # every entry is long past due, so setting a TTL later would purge the whole cache
   # at once. Remove it.
@@ -284,78 +335,280 @@ if [[ "${DRY_RUN}" != "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# apt-cacher-ng: same image and Remap table as deploy-apt-cache.sh
+# apt-nginx: the apt cache
 # ---------------------------------------------------------------------------
-log "Writing Dockerfile.acng"
-cat > "${STACK_DIR}/Dockerfile.acng" <<EOF
-FROM debian:trixie-slim
-RUN apt-get update \\
- && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
-      apt-cacher-ng ca-certificates curl \\
- && rm -rf /var/lib/apt/lists/*
-RUN usermod -u ${ACNG_UID} apt-cacher-ng \\
- && groupmod -g ${ACNG_UID} apt-cacher-ng \\
- && chown -R ${ACNG_UID}:${ACNG_UID} \\
-      /etc/apt-cacher-ng /var/cache/apt-cacher-ng /var/log/apt-cacher-ng \\
- && install -d -o ${ACNG_UID} -g ${ACNG_UID} /run/apt-cacher-ng
-USER apt-cacher-ng
-ENTRYPOINT ["/usr/sbin/apt-cacher-ng"]
-CMD ["-c", "/etc/apt-cacher-ng", "ForeGround=1"]
-EOF
+# Quoted heredocs, so every nginx $variable stays literal; only the table rows
+# and the two sizes are generated, with constant printf formats.
+log "Writing apt-nginx.conf"
+{
+  cat <<'NGINX'
+# apt-nginx: the apt cache for the /repository/<name>/ prefixes in APT_REPOS.
+# Two tiers: :3142 caches (keys, slices, locks, stale); 127.0.0.1:8091 fetches
+# (DNS, TLS, redirects) and never caches. slice and redirect-following must never
+# share a tier: a slice subrequest that follows a redirect loses its Range and
+# splices a whole body into the file.
 
-log "Writing acng.conf"
-cat > "${STACK_DIR}/acng.conf" <<'EOF'
-CacheDir: /var/cache/apt-cacher-ng
-LogDir: /var/log/apt-cacher-ng
-Port: 3142
-BindAddress: 0.0.0.0
+worker_processes auto;
+worker_rlimit_nofile 65536;            # slice 1m holds one fd per MB in flight; short = truncated 200s
+error_log /dev/stderr warn;
+pid /run/nginx.pid;
 
-# Not an open forward proxy. Every reachable repository is named in a Remap
-# below; anything else is refused. Caddy now routes public traffic here, so an
-# empty PassThroughPattern is what keeps this from becoming an open relay.
-ForwardBtsSoap: 0
-PassThroughPattern: ^$
+events { worker_connections 8192; }
 
-# Days an unreferenced file survives before expiry deletes it. The packaged
-# default is 4, which is dangerous here: the upstream docs warn that if an index
-# is unavailable for a few days -- a mirror outage, exactly the case this cache
-# exists for -- still-useful package files get removed. 45 days means an outage
-# has to last six weeks before the cache starts eroding.
-#
-# Retention, not freshness. Raw is always-revalidate and the helm index is five
-# minutes; both are correct and neither belongs here.
-ExThreshold: 45
-VerboseLog: 1
-ReportPage: acng-report.html
+http {
+    default_type application/octet-stream;
+    sendfile on;
+    server_tokens off;
 
-# Several local prefixes on one Remap share a cache tree. The nine ubuntu-*
-# repositories differ only by the suite in the path and share an identical
-# pool/, so they get one tree rather than nine copies of every .deb.
-# archive.ubuntu.com carries every suite including -security.
-Remap-ubuntu: /repository/ubuntu-jammy /repository/ubuntu-jammy-updates /repository/ubuntu-jammy-security /repository/ubuntu-noble /repository/ubuntu-noble-updates /repository/ubuntu-noble-security /repository/ubuntu-resolute /repository/ubuntu-resolute-updates /repository/ubuntu-resolute-security ; http://archive.ubuntu.com/ubuntu http://security.ubuntu.com/ubuntu
+    log_format apt   '$time_iso8601 $status $upstream_cache_status [$upstream_status] '
+                     '[$upstream_response_time] $body_bytes_sent/$sent_http_content_length '
+                     '$request_time $request_method $request_uri "$http_user_agent"';
+    log_format fetch 'fetch $status [$upstream_status] [$upstream_addr] [$upstream_connect_time] '
+                     '[$upstream_response_time] $body_bytes_sent $request_time $request_uri';
 
-# debian-security is a genuinely separate archive with its own pool/, so unlike
-# Ubuntu it does NOT merge with the main one.
-Remap-debian: /repository/debian-bookworm /repository/debian-bookworm-updates /repository/debian-trixie /repository/debian-trixie-updates ; https://deb.debian.org/debian
-Remap-debiansecurity: /repository/debian-bookworm-security /repository/debian-trixie-security ; https://security.debian.org/debian-security
+    # Docker DNS, IPv4 only: the compose network has no IPv6 route.
+    resolver 127.0.0.11 ipv6=off valid=30s;
+    resolver_timeout 5s;
 
-# pkgs.k8s.io publishes each minor as an independent flat repository: no shared
-# pool, so merging would be wrong.
-Remap-k8s132: /repository/kubernetes-v1-32 ; https://pkgs.k8s.io/core:/stable:/v1.32/deb
-Remap-k8s133: /repository/kubernetes-v1-33 ; https://pkgs.k8s.io/core:/stable:/v1.33/deb
-Remap-k8s134: /repository/kubernetes-v1-34 ; https://pkgs.k8s.io/core:/stable:/v1.34/deb
-Remap-k8s135: /repository/kubernetes-v1-35 ; https://pkgs.k8s.io/core:/stable:/v1.35/deb
-Remap-k8s136: /repository/kubernetes-v1-36 ; https://pkgs.k8s.io/core:/stable:/v1.36/deb
-Remap-k8s137: /repository/kubernetes-v1-37 ; https://pkgs.k8s.io/core:/stable:/v1.37/deb
+    proxy_http_version 1.1;
+    proxy_buffer_size 32k;             # Buildkite's signed Location header does not fit in 4k
+    proxy_buffers 8 32k;
+    proxy_busy_buffers_size 64k;
+    proxy_max_temp_file_size 2048m;    # never 0: that silently stops caching anything > buffers
 
-# download.docker.com publishes linux/ubuntu and linux/debian as separate trees.
-Remap-dockerubuntu: /repository/docker-ubuntu-jammy /repository/docker-ubuntu-noble /repository/docker-ubuntu-resolute ; https://download.docker.com/linux/ubuntu
-Remap-dockerdebian: /repository/docker-debian-bookworm /repository/docker-debian-trixie ; https://download.docker.com/linux/debian
+    # Separate zones so package churn can never evict the indexes outages depend on.
+    # No min_free on idx: pool fills would otherwise evict every index under disk pressure.
+    proxy_cache_path /var/cache/apt-nginx/idx  levels=1:2 keys_zone=apt_idx:32m
+                     max_size=10g inactive=45d use_temp_path=off;
+NGINX
+  printf '    proxy_cache_path /var/cache/apt-nginx/pool levels=1:2 keys_zone=apt_pool:256m\n'
+  printf '                     max_size=%s min_free=%s inactive=45d\n' "${APT_CACHE_MAX_SIZE}" "${APT_CACHE_MIN_FREE}"
+  printf '                     loader_files=1000 loader_threshold=300ms use_temp_path=off;\n'
+  cat <<'NGINX'
 
-# distribution=any against a remote already ending in /any/, so the upstream path
-# really is .../helm-debian/any/dists/any/. Preserved verbatim.
-Remap-helmapt: /repository/helm-apt ; https://packages.buildkite.com/helm-linux/helm-debian/any
-EOF
+
+    # ---------------- request validation ----------------
+    # GET/HEAD without a body: a body would be forwarded upstream.
+    map $request_method$http_content_length$http_transfer_encoding $apt_bad_method { default 1; GET 0; HEAD 0; }
+
+    # Allow-list on the raw path. apt 2.4-3.2 escapes ~ and + (%7e, %2b); no other escape is
+    # allowed, so the key ($uri) and upstream path ($request_uri) name the same object.
+    # No query, no dot or empty segments.
+    map $request_uri $apt_bad {
+        default 1;
+        "/healthz" 0;
+        ~/\.\.?(?:/|$) 1;
+        "~^/repository/[a-z0-9-]+(?:/(?:[A-Za-z0-9._~+:@-]|%7[Ee]|%2[Bb])+)+/?$" 0;
+    }
+
+    # ---------------- repo table, from APT_REPOS ----------------
+    map $uri $apt_origin {
+        default "";
+NGINX
+  for entry in "${APT_REPOS[@]}"; do
+    IFS='|' read -r name host base _ <<<"${entry}"
+    printf '        ~^/repository/%-28s %s%s;\n' "${name}/" "${host}" "${base}"
+  done
+  cat <<'NGINX'
+    }
+    # Upstream path is raw (apt's %7e must reach the CDN as sent); the key path is decoded,
+    # so %7e and ~ share one entry. The key never includes $host or the client prefix.
+    map $request_uri $apt_path     { ~^/repository/[^/?]+(?<apt_p>/[^?]*)  $apt_p; }
+    map $uri         $apt_key_path { ~^/repository/[^/]+(?<apt_kp>/.*)$    $apt_kp; }
+
+    # Captive portals, error pages, empty bodies. volatile: re-evaluated per slice subrequest.
+    map $upstream_http_content_type $apt_nocache { volatile; default 0; ~*^text/html 1; }
+    map $upstream_http_content_length $apt_empty { volatile; default 0; "0" 1; }
+
+    upstream apt_fetch { zone apt_fetch 64k; server 127.0.0.1:8091; keepalive 32; }
+
+    # ================= cache tier. No error_page here: it would break slice. =================
+    server {
+        listen 3142;
+        access_log /dev/stdout apt;
+
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 50s;            # > fetch worst case: 25s of attempts + 3s connect + 20s read
+        proxy_next_upstream off;           # loopback: nothing to retry
+        proxy_pass_request_headers off;    # nothing from the client reaches an upstream
+        proxy_hide_header Set-Cookie;
+
+        if ($apt_bad_method) { return 405; }
+        if ($apt_bad)        { return 400; }
+
+        location = /healthz { return 200 "ok\n"; }
+
+        # 1. Pool: packages and anything under pool/. Immutable, sliced, shared across prefixes.
+        location ~ (?:^/repository/[^/]+/(?:.+/)?pool/|\.(?:deb|udeb|ddeb)$) {
+            if ($apt_origin = "") { return 404; }
+            slice 1m;
+            proxy_cache apt_pool;
+            proxy_cache_key "$apt_origin$apt_key_path$slice_range";
+            # a location-level proxy_set_header replaces the whole inherited list: repeat all
+            proxy_set_header Range $slice_range;
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires
+                                 X-Accel-Redirect X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset;
+            proxy_hide_header Set-Cookie;
+            proxy_hide_header ETag;            # else slice pins slice 0's ETag: one upstream ETag change breaks the file for good
+            proxy_hide_header Last-Modified;   # no If-Range match: a resume after a failed fill restarts from byte 0
+            proxy_cache_valid 200 206 3650d;   # retention is inactive=/max_size
+            proxy_cache_lock on;
+            proxy_cache_lock_age 25s;          # < apt's 30s timeout: waiters on a dead worker's lock recover in time
+            keepalive_timeout 0;               # nginx bug: a failed slice mid-body is not an error; close so apt sees one
+            proxy_ignore_client_abort on;      # a fill whose client left is still cached, not discarded
+            proxy_cache_lock_timeout 1h;       # waiters never bypass the cache
+            proxy_cache_background_update off;
+            proxy_cache_use_stale error timeout invalid_header updating
+                                  http_500 http_502 http_503 http_504;
+            proxy_no_cache $apt_nocache $apt_empty;
+            proxy_pass http://apt_fetch/$apt_origin$apt_path;
+        }
+
+        # 2. Immutable indexes: by-hash and pdiff patches. Sliced like the pool, so lock waiters
+        #    on a large index (~20 MB Ubuntu Packages) get bytes before apt's 30s timeout.
+        location ~ (?:^/repository/[^/]+/dists/.+/by-hash/|^/repository/[^/]+/dists/.+\.diff/T-[^/]+$) {
+            if ($apt_origin = "") { return 404; }
+            slice 1m;
+            proxy_cache apt_idx;
+            proxy_cache_key "$apt_origin$apt_key_path$slice_range";
+            proxy_set_header Range $slice_range;
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires
+                                 X-Accel-Redirect X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset;
+            proxy_hide_header Set-Cookie;
+            proxy_hide_header ETag;
+            proxy_hide_header Last-Modified;
+            proxy_cache_valid 200 206 3650d;
+            proxy_cache_lock on;
+            proxy_cache_lock_age 25s;
+            proxy_cache_lock_timeout 120s;
+            keepalive_timeout 0;
+            proxy_ignore_client_abort on;      # a fill whose client left is still cached, not discarded
+            proxy_cache_background_update off;
+            proxy_cache_use_stale error timeout invalid_header updating
+                                  http_500 http_502 http_503 http_504;
+            proxy_no_cache $apt_nocache $apt_empty;
+            proxy_pass http://apt_fetch/$apt_origin$apt_path;
+        }
+
+        # 3. Mutable indexes: dists/ and the flat (k8s) index names. 1s + revalidate keeps
+        #    InRelease and Packages from different publishes apart. Never `updating`: it serves
+        #    the old InRelease while the new Packages is already cached.
+        #    Index names only: installer images under dists/ fall through to the 404.
+        location ~ (?:^/repository/[^/]+/dists/(?:.+/)?(?:InRelease|Release(?:\.gpg)?|Index|(?:Packages|Sources|Translation-[^/]+|Contents-[^/]+|Components-[^/]+|icons-[^/]+|Commands-[^/]+|CID-Index-[^/]+)(?:\.[A-Za-z0-9]+)*)$|^/repository/[^/]+/(?:InRelease|Release|Release\.gpg|Packages(?:\.(?:gz|xz|bz2|lzma|zst))?)$) {
+            if ($apt_origin = "") { return 404; }
+            proxy_cache apt_idx;
+            proxy_cache_key "$apt_origin$apt_key_path";
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_ignore_headers Cache-Control Expires Set-Cookie Vary X-Accel-Expires
+                                 X-Accel-Redirect X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset;
+            proxy_cache_valid 200 1s;          # must stay > 0: 0 means "do not cache"
+            proxy_cache_revalidate on;         # a refresh is a conditional GET, usually a 304
+            proxy_set_header If-None-Match "";  # date-only revalidation: a lagging mirror's older copy answers 304, never replaces a newer one
+            proxy_cache_lock on;               # collapses cold misses only, not refreshes
+            proxy_cache_lock_age 10s;
+            proxy_cache_lock_timeout 15s;
+            proxy_cache_background_update off;
+            proxy_read_timeout 15s;            # stale well inside apt's 30s timeout
+            proxy_cache_use_stale error timeout invalid_header
+                                  http_500 http_502 http_503 http_504 http_403 http_429;
+            proxy_no_cache $apt_nocache $apt_empty;
+            proxy_pass http://apt_fetch/idx/$apt_origin$apt_path;
+        }
+
+        # 4. Anything else (ls-lR.gz, installer images, unknown repos): refused.
+        location / { return 404; }
+    }
+
+    # ================= fetch tier: DNS, TLS, keepalive, redirects. Never caches. =================
+    map $request_uri $fetch_host { ~^/(?:idx/)?(?<fh>[^/?]+)/       $fh; }
+    map $request_uri $fetch_path { ~^/(?:idx/)?[^/?]+(?<fp>/[^?]*)  $fp; }
+    map $fetch_host $fetch_scheme {    # allow-list: the distinct APT hosts, nothing else
+        default "";
+NGINX
+  for host in "${apt_hosts[@]}"; do printf '        %-25s https;\n' "${host}"; done
+  cat <<'NGINX'
+    }
+
+    # Each group is named exactly after its host: the group name is the SNI and verify name.
+    # max_fails=1 fail_timeout=10s skips a dead address for 10s; no effect on a single-address host.
+    # keepalive_timeout 4s: below Apache's 5s idle close; a silently dropped pooled connection costs 20s.
+NGINX
+  for i in "${!apt_hosts[@]}"; do
+    printf '    upstream %s { zone apt_up_%d 64k; server %s:443 resolve max_fails=1 fail_timeout=10s; keepalive 16; keepalive_timeout 4s; }\n' \
+      "${apt_hosts[$i]}" "${i}" "${apt_hosts[$i]}"
+  done
+  cat <<'NGINX'
+
+
+    server {
+        listen 127.0.0.1:8091;
+        access_log /dev/stdout fetch;
+        recursive_error_pages on;          # hop 2+; nginx caps the chain at 10 (500)
+
+        proxy_ssl_server_name on;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 4;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 20s;            # < next_upstream_timeout; also the longest mid-body stall a fill survives
+        proxy_next_upstream error timeout; # across the resolved addresses; no _tries cap
+        proxy_next_upstream_timeout 25s;
+        proxy_buffering off;               # the cache tier buffers
+        proxy_intercept_errors on;
+        proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset;
+        error_page 301 302 303 307 308 = @apt_follow;
+
+        location / {
+            if ($fetch_scheme = "") { return 403; }
+            proxy_set_header Host $fetch_host;
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_pass $fetch_scheme://$fetch_host$fetch_path;
+        }
+
+        location /idx/ {                   # mutable indexes: a stalled peer is cut in time for one retry inside the cache tier's 15s
+            proxy_read_timeout 7s;
+            error_page 301 302 303 307 308 = @apt_follow_idx;
+            if ($fetch_scheme = "") { return 403; }
+            proxy_set_header Host $fetch_host;
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_pass $fetch_scheme://$fetch_host$fetch_path;
+        }
+
+        location @apt_follow {
+            # an `if`, not a map: a map is evaluated once per request, so hop 2+ would reuse hop 1's verdict
+            if ($upstream_http_location !~ "^https://[a-z0-9]+\.cloudfront\.net/") { return 502; }
+            set $apt_redirect $upstream_http_location;
+            proxy_set_header Host $proxy_host;
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_set_header Authorization "";
+            proxy_pass $apt_redirect;
+        }
+
+        location @apt_follow_idx {
+            proxy_read_timeout 7s;
+            # an `if`, not a map: a map is evaluated once per request, so hop 2+ would reuse hop 1's verdict
+            if ($upstream_http_location !~ "^https://[a-z0-9]+\.cloudfront\.net/") { return 502; }
+            set $apt_redirect $upstream_http_location;
+            proxy_set_header Host $proxy_host;
+            proxy_set_header Connection "";
+            proxy_set_header Accept-Encoding "";
+            proxy_set_header Authorization "";
+            proxy_pass $apt_redirect;
+        }
+    }
+}
+NGINX
+} > "${STACK_DIR}/apt-nginx.conf"
+! grep -qF '${' "${STACK_DIR}/apt-nginx.conf" || die "unrendered placeholder left in ${STACK_DIR}/apt-nginx.conf"
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +620,8 @@ EOF
 log "Writing nginx.conf"
 {
   echo "worker_processes auto;"
-  echo "error_log /var/log/nginx/error.log warn;"
+  # stderr, not a file: the reload check reads [emerg] from the container log.
+  echo "error_log stderr warn;"
   echo "events { worker_connections 2048; }"
   echo "http {"
   echo "  include /etc/nginx/mime.types;"
@@ -553,7 +807,10 @@ log "Writing landing page"
     echo "<li><code>${sub}.${BASE_DOMAIN}</code> &rarr; ${up}</li>"
   done
   echo "</ul><h2>APT (${#APT_REPOS[@]})</h2><ul>"
-  for r in "${APT_REPOS[@]}"; do echo "<li><code>/repository/${r}/</code></li>"; done
+  for entry in "${APT_REPOS[@]}"; do
+    IFS='|' read -r name host base _ <<<"${entry}"
+    echo "<li><code>/repository/${name}/</code> &rarr; https://${host}${base}</li>"
+  done
   echo "</ul><h2>Helm</h2><ul>"
   for entry in "${HELM_REPOS[@]}"; do
     IFS=: read -r name host path <<<"${entry}"
@@ -604,9 +861,29 @@ official_rewrite() {
   echo "  rewrite @official /v2/$1/{re.official.1}/{re.official.2}/{re.official.3}"
 }
 
-# Build the apt route matcher from the table above, so the Caddyfile and the
-# Remap table cannot drift apart silently.
-apt_alternation="$(IFS='|'; echo "${APT_REPOS[*]}")"
+# Caddy adds X-Forwarded-For / -Proto / -Host to every proxied request. That is
+# right for a backend you own and wrong for a third-party origin: these are
+# public CDNs being fetched as an ordinary client, which is what Nexus did.
+# packages.buildkite.com is the proof -- it answers a request carrying
+# X-Forwarded-Host with a 301 to its marketing site instead of the signed CDN
+# URL for the key. Strip them here: content-cache forwards client headers
+# upstream (apt-nginx does not, but gets the same treatment).
+#
+# Caddy logs "Unnecessary header_up X-Forwarded-Proto: the reverse proxy's
+# default behavior is to pass headers to the upstream" once per route on load.
+# That warning is spurious: it matches the header name without noticing the
+# leading "-" that makes this a deletion. Verified against a controlled
+# upstream that all three headers do arrive on an unmodified route and none of
+# them arrives on a stripped one. Do not "fix" the warning by removing these.
+strip_forwarded() {
+  echo "      header_up -X-Forwarded-For"
+  echo "      header_up -X-Forwarded-Proto"
+  echo "      header_up -X-Forwarded-Host"
+}
+
+# Build the apt route matcher from the table above, so the Caddyfile and
+# apt-nginx.conf cannot drift apart silently.
+apt_alternation="$(IFS='|'; echo "${apt_names[*]}")"
 
 log "Writing Caddyfile"
 {
@@ -668,33 +945,20 @@ log "Writing Caddyfile"
   echo "    respond \"ok\" 200"
   echo "  }"
   echo
-  echo "  # ---- APT: ${#APT_REPOS[@]} repositories, one upstream ----"
+  echo "  # ---- APT: ${#APT_REPOS[@]} repositories ----"
   echo "  @apt path_regexp ^/repository/(${apt_alternation})(/|\$)"
   echo "  handle @apt {"
-  echo "    reverse_proxy apt-cache:3142 {"
+  echo "    reverse_proxy apt-nginx:3142 {"
   echo "      header_up Host {host}"
+  strip_forwarded
+  # A killed nginx worker drops the connection, and Caddy's own 502 has no
+  # body, which apt treats as final. Caddy retries only when no response
+  # headers came back, so a download is never duplicated or spliced.
+  echo "      lb_retries 2"
+  echo "      lb_try_interval 250ms"
   echo "    }"
   echo "  }"
   echo
-
-  # Caddy adds X-Forwarded-For / -Proto / -Host to every proxied request. That is
-  # right for a backend you own and wrong for a third-party origin: these are
-  # public CDNs being fetched as an ordinary client, which is what Nexus did.
-  # packages.buildkite.com is the proof -- it answers a request carrying
-  # X-Forwarded-Host with a 301 to its marketing site instead of the signed CDN
-  # URL for the key. Strip them here: nginx forwards client headers upstream.
-  #
-  # Caddy logs "Unnecessary header_up X-Forwarded-Proto: the reverse proxy's
-  # default behavior is to pass headers to the upstream" once per route on load.
-  # That warning is spurious: it matches the header name without noticing the
-  # leading "-" that makes this a deletion. Verified against a controlled
-  # upstream that all three headers do arrive on an unmodified route and none of
-  # them arrives on a stripped one. Do not "fix" the warning by removing these.
-  strip_forwarded() {
-    echo "      header_up -X-Forwarded-For"
-    echo "      header_up -X-Forwarded-Proto"
-    echo "      header_up -X-Forwarded-Host"
-  }
 
   # Helm and raw both go to nginx, which caches them, serves what it has when
   # the upstream is unreachable, rewrites chart URLs and follows redirects.
@@ -805,14 +1069,20 @@ compose_logging() {
   echo "      - ${STACK_DIR}/caddy-data:/data"
   echo "      - ${STACK_DIR}/caddy-config:/config"
   echo "      - ${STACK_DIR}/certs:/certs:ro"
+  # apt-nginx closes its connection after every sliced response (see
+  # apt-nginx.conf), which leaves Caddy's side in TIME_WAIT. Without reuse, one
+  # fast client can exhaust Caddy's ephemeral ports and every apt request 502s.
+  echo "    sysctls:"
+  echo "      - net.ipv4.tcp_tw_reuse=1"
   echo "    depends_on:"
-  echo "      - apt-cache"
+  echo "      - apt-nginx"
   echo "      - content-cache"
   echo
   echo "  content-cache:"
-  echo "    image: nginx:alpine"
+  echo "    image: ${NGINX_IMAGE}"
   echo "    container_name: content-cache"
   echo "    restart: unless-stopped"
+  compose_logging
   echo "    volumes:"
   echo "      - ${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro"
   echo "      - ${STACK_DIR}/content-cache:/var/cache/nginx"
@@ -824,19 +1094,22 @@ compose_logging() {
   echo "      retries: 3"
   echo "      start_period: 10s"
   echo
-  echo "  apt-cache:"
-  echo "    build:"
-  echo "      context: ."
-  echo "      dockerfile: Dockerfile.acng"
-  echo "    container_name: apt-cache"
+  echo "  apt-nginx:"
+  echo "    image: ${NGINX_IMAGE}"
+  echo "    container_name: apt-nginx"
   echo "    restart: unless-stopped"
   compose_logging
+  echo "    # One file descriptor per 1 MB slice in flight; the default runs out under"
+  echo "    # a cold bootstrap wave and nginx then truncates responses."
+  echo "    ulimits:"
+  echo "      nofile:"
+  echo "        soft: 65536"
+  echo "        hard: 65536"
   echo "    volumes:"
-  echo "      - ${STACK_DIR}/acng.conf:/etc/apt-cacher-ng/acng.conf:ro"
-  echo "      - ${STACK_DIR}/apt-cache:/var/cache/apt-cacher-ng"
-  echo "      - ${STACK_DIR}/apt-log:/var/log/apt-cacher-ng"
+  echo "      - ${STACK_DIR}/apt-nginx.conf:/etc/nginx/nginx.conf:ro"
+  echo "      - ${STACK_DIR}/apt-nginx-cache:/var/cache/apt-nginx"
   echo "    healthcheck:"
-  echo "      test: [\"CMD-SHELL\", \"curl -fsS http://127.0.0.1:3142/acng-report.html >/dev/null\"]"
+  echo "      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1:3142/healthz >/dev/null || exit 1\"]"
   echo "      interval: 30s"
   echo "      timeout: 5s"
   echo "      retries: 3"
@@ -880,13 +1153,11 @@ fi
 # ---------------------------------------------------------------------------
 # Cutover
 # ---------------------------------------------------------------------------
-# Build before stopping anything. A failed image build with Nexus already down
-# is an outage for no reason.
-log "Building images (current stack still serving)"
+# compose resolves the project from the working directory.
 cd "${STACK_DIR}"
-docker compose build
 
-# Pull before stopping anything, for the same reason the build happens first.
+# Pull before stopping anything: a failed pull with Nexus already down is an
+# outage for no reason.
 #
 # `docker compose up` fetches what it does not have, which is after the teardown
 # -- so an unreachable registry, an expired credential or a withdrawn tag became
@@ -919,38 +1190,64 @@ log "Starting the mirror stack"
 cd "${STACK_DIR}"
 # --remove-orphans clears containers this compose file no longer declares, such
 # as a registry removed from REGISTRIES. Left behind, it keeps running and
-# answering, which makes a stale route look healthy.
-docker compose up -d --remove-orphans
+# answering, which makes a stale route look healthy. On a host that ran
+# apt-cacher-ng this is also what removes its container; its cache in
+# apt-cache/ is left on disk.
+docker compose up -d --remove-orphans || die "could not start the stack; apt may be unavailable until a run succeeds -- check: docker compose -f ${STACK_DIR}/docker-compose.yml ps"
 
-# Now apply the config changes compose cannot see.
-if [[ "$(cfg_sum "${STACK_DIR}/Caddyfile")" != "${CADDY_SUM_BEFORE}" ]]; then
-  log "Caddyfile changed, reloading Caddy"
-  # --force because a reload is skipped when Caddy judges the config unchanged,
-  # and the certificate files it points at can change without the file doing so.
-  docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force \
-    || die "Caddy would not load the new config. The previous one is still serving -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs caddy"
-else
-  log "Caddyfile unchanged"
-fi
-
-if [[ "$(cfg_sum "${STACK_DIR}/acng.conf")" != "${ACNG_SUM_BEFORE}" ]]; then
-  # apt-cacher-ng has no reload; the config is read at startup only.
-  log "acng.conf changed, restarting apt-cache"
-  docker compose restart apt-cache
-else
-  log "acng.conf unchanged"
-fi
-
-# Reloaded every run, not on checksum change: a run that died after writing
-# nginx.conf would otherwise leave the old config serving. A just-started nginx
-# has no pid file yet, and reloading then fails.
-log "Reloading content-cache"
-for _ in $(seq 1 30); do
-  docker compose exec -T content-cache test -s /run/nginx.pid && break
+# compose does not notice a changed bind-mounted file, so every config is
+# applied explicitly, on every run: a run that died after writing one must not
+# leave the old one serving on the next.
+#
+# --force because Caddy skips a reload it judges unchanged, and the certificate
+# files it points at can change without the Caddyfile doing so. Caddy may have
+# just been (re)created, and its admin API takes a moment to listen.
+log "Reloading Caddy"
+for _ in $(seq 1 10); do
+  docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force >/dev/null 2>&1 && break
   sleep 1
 done
-docker compose exec -T content-cache sh -c 'nginx -t && nginx -s reload' \
-  || die "nginx would not load ${STACK_DIR}/nginx.conf -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs content-cache"
+docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force \
+  || die "Caddy would not load the new config -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs caddy"
+
+wait_healthz() { # service, port
+  for _ in $(seq 1 30); do
+    docker compose exec -T "$1" wget -qO- "http://127.0.0.1:$2/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  die "$1 is not answering -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs $1"
+}
+
+# `nginx -t` passes some changes the running master then refuses on reload -- a
+# cache zone's path or levels= -- and that refusal only shows as [emerg] in its
+# log while the old config keeps serving. So read the log, and restart once when
+# it appears. The log is read into a variable first: under pipefail,
+# `logs | grep -q` loses the match to SIGPIPE.
+nginx_apply() { # service, port
+  local svc="$1" port="$2" out since
+  [[ -n "$(docker compose ps --status running -q "${svc}")" ]] || docker compose up -d --force-recreate "${svc}"
+  wait_healthz "${svc}" "${port}"
+  if ! out="$(docker compose exec -T "${svc}" nginx -t 2>&1)"; then
+    echo "${out}" >&2
+    die "${svc} rejected its new config; the previous one is still serving.
+The rejected file is already on disk, so do not restart ${svc} until a run succeeds."
+  fi
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  docker compose exec -T "${svc}" nginx -s reload
+  sleep 2
+  out="$(docker compose logs --no-color --no-log-prefix --since "${since}" "${svc}" 2>&1)" || out=""
+  if grep -Eq '^[0-9/]{10} [0-9:]{8} \[emerg\]' <<<"${out}"; then
+    grep -E '\[emerg\]' <<<"${out}" >&2 || true
+    log "${svc} refused the reload; restarting it"
+    docker compose restart "${svc}"
+    wait_healthz "${svc}" "${port}"
+  fi
+}
+
+log "Applying apt-nginx.conf"
+nginx_apply apt-nginx 3142
+log "Applying nginx.conf"
+nginx_apply content-cache 8080
 
 # ---------------------------------------------------------------------------
 # Verify
@@ -1010,9 +1307,143 @@ done
 
 echo
 log "Public checks over TLS"
-check "apt  ubuntu-noble" '^200$' "https://${BASE_DOMAIN}/repository/ubuntu-noble/dists/noble/InRelease"
-check "apt  debian-trixie" '^200$' "https://${BASE_DOMAIN}/repository/debian-trixie/dists/trixie/InRelease"
-check "apt  kubernetes-v1-34" '^200$' "https://${BASE_DOMAIN}/repository/kubernetes-v1-34/Release"
+# Check keys and signed indexes by content: a redirect to an HTML page also
+# returns 200.
+check_pgp(){ # label, url, curl args...
+  local label="$1" url="$2" body; shift 2
+  body="$(curl -fsS --max-time 45 "$@" "${url}" 2>/dev/null)" || body=""
+  if [[ "${body}" == "-----BEGIN PGP"* ]]; then printf '  ok    %-30s pgp\n' "${label}"
+  else printf '  FAIL  %-30s not pgp  (%s)\n' "${label}" "${url}"; failed=$((failed + 1)); fi
+}
+warn(){ printf '  WARN  %-30s %s\n' "$1" "$2"; }
+
+# ---- apt: every repository through Caddy, and straight at apt-nginx ----
+# Straight at apt-nginx takes Caddy out of the picture: a Caddy-only pass or
+# failure shows up as a difference between the two.
+direct_status(){ # path -> HTTP status from apt-nginx itself
+  local out
+  out="$(docker compose exec -T apt-nginx wget -S -O /dev/null "http://127.0.0.1:3142$1" 2>&1)" || true
+  awk 'match($0, /HTTP\/1\.[01] [0-9][0-9][0-9]/) {c = substr($0, RSTART + 9, 3)} END {print (c ? c : "000")}' <<<"${out}"
+}
+apt_tmp="$(mktemp -d)"; trap 'rm -rf "${apt_tmp}"' EXIT
+apt_url(){ echo "https://${BASE_DOMAIN}/repository/$1/$2"; }
+index_of(){ [[ -n "$1" ]] && echo "dists/$1/InRelease" || echo "InRelease"; }
+dir_of(){ [[ -n "$1" ]] && echo "dists/$1/" || echo ""; }
+
+for entry in "${APT_REPOS[@]}"; do
+  IFS='|' read -r name _ _ suite <<<"${entry}"
+  idx="$(index_of "${suite}")"
+  curl -fsS --max-time 45 "${RESOLVE[@]}" -o "${apt_tmp}/${name}.rel" "$(apt_url "${name}" "${idx}")" 2>/dev/null || :
+  code="$(direct_status "/repository/${name}/${idx}")"
+  if [[ "$(head -c 14 "${apt_tmp}/${name}.rel" 2>/dev/null)" == "-----BEGIN PGP" && "${code}" == "200" ]]; then
+    printf '  ok    %-30s pgp, direct %s\n' "apt  ${name}" "${code}"
+  else
+    printf '  FAIL  %-30s not pgp via Caddy, or direct %s  (%s)\n' "apt  ${name}" "${code}" "$(apt_url "${name}" "${idx}")"
+    failed=$((failed + 1))
+  fi
+done
+
+# InRelease lists each index with its SHA256 and size.
+# A missing file (the fetch failed, already reported above) is an empty list,
+# not a reason for pipefail and set -e to end the run before the summary.
+sha256_list(){ awk '/^SHA256:/ {f=1; next} /^[^ ]/ {f=0} f {print $1, $2, $3}' "$1" 2>/dev/null || true; }
+
+# kubernetes: the index apt downloads must match the InRelease that lists it.
+# This is the regression check for the %3a bug, where they came from different
+# publishes. A publish between the two fetches is possible, hence one retry.
+for entry in "${APT_REPOS[@]}"; do
+  IFS='|' read -r name _ _ suite <<<"${entry}"
+  [[ "${name}" == kubernetes-* ]] || continue
+  result="FAIL"
+  for attempt in 1 2; do
+    curl -fsS --max-time 45 "${RESOLVE[@]}" -o "${apt_tmp}/${name}.rel" "$(apt_url "${name}" InRelease)" 2>/dev/null || :
+    want="$(sha256_list "${apt_tmp}/${name}.rel" | awk '$3 == "Packages.gz" {print $1; exit}')"
+    got="$(curl -fsS --max-time 45 "${RESOLVE[@]}" "$(apt_url "${name}" Packages.gz)" 2>/dev/null | sha256sum | cut -d' ' -f1)" || got=""
+    [[ -n "${want}" && "${want}" == "${got}" ]] && { result="ok"; break; }
+    [[ "${attempt}" == 1 ]] && sleep 5
+  done
+  if [[ "${result}" == "ok" ]]; then printf '  ok    %-30s matches InRelease\n' "apt  ${name} Packages.gz"
+  else printf '  FAIL  %-30s does not match its InRelease\n' "apt  ${name} Packages.gz"; failed=$((failed + 1)); fi
+done
+
+# One package per upstream host, from that host's smallest package index:
+# a range request must come back 206 with the full size the index lists, and
+# start like a .deb. This goes through the sliced package path end to end.
+decompress(){ case "$1" in *.gz) gzip -dc "$2" ;; *.xz) xz -dc "$2" ;; esac; }
+for host in "${apt_hosts[@]}"; do
+  best=""
+  for entry in "${APT_REPOS[@]}"; do
+    IFS='|' read -r name h _ suite <<<"${entry}"
+    [[ "${h}" == "${host}" ]] || continue
+    while read -r sha size path; do
+      # |-separated: a flat repository's suite is empty.
+      [[ -z "${best}" || "${size}" -lt "${best%%|*}" ]] && best="${size}|${name}|${suite}|${path}|${sha}"
+    done < <(sha256_list "${apt_tmp}/${name}.rel" \
+             | awk '$3 ~ /^([a-z-]+\/binary-amd64\/)?Packages\.(gz|xz)$/ && $2 > 200')
+  done
+  label="apt  ${host%%.*} .deb"
+  if [[ -z "${best}" ]]; then printf '  FAIL  %-30s no package index found\n' "${label}"; failed=$((failed + 1)); continue; fi
+  IFS='|' read -r _ name suite path sha <<<"${best}"
+  if [[ "${path}" == *.xz ]] && ! command -v xz >/dev/null; then warn "${label}" "skipped: xz is not installed"; continue; fi
+  curl -fsS --max-time 60 "${RESOLVE[@]}" -o "${apt_tmp}/pkgs" "$(apt_url "${name}" "$(dir_of "${suite}")${path}")" 2>/dev/null || :
+  decompress "${path}" "${apt_tmp}/pkgs" > "${apt_tmp}/pkgs.txt" 2>/dev/null || :
+  read -r deb size < <(awk '/^Filename: / {f=$2} /^Size: / {s=$2} /^$/ && f && s {print f, s; exit}' "${apt_tmp}/pkgs.txt") || deb=""
+  if [[ -z "${deb}" ]]; then printf '  FAIL  %-30s could not read %s\n' "${label}" "${path}"; failed=$((failed + 1)); continue; fi
+  hdr="$(curl -sS --max-time 60 "${RESOLVE[@]}" -r 0-1023 -D - -o "${apt_tmp}/deb" "$(apt_url "${name}" "${deb}")" 2>/dev/null)" || hdr=""
+  code="$(awk 'NR == 1 {print $2}' <<<"${hdr}")"
+  total="$(awk 'tolower($1) == "content-range:" {sub(/.*\//, "", $NF); gsub(/\r/, "", $NF); print $NF}' <<<"${hdr}")"
+  if [[ "${code}" == "206" && "${total}" == "${size}" && "$(head -c 7 "${apt_tmp}/deb" 2>/dev/null)" == '!<arch>' ]]; then
+    printf '  ok    %-30s 206, %s bytes\n' "${label}" "${size}"
+  else
+    printf '  FAIL  %-30s %s, range total %s, want %s  (%s)\n' "${label}" "${code:-000}" "${total:-none}" "${size}" "${deb}"; failed=$((failed + 1))
+  fi
+  # The index itself by its hash: what apt actually requests on archives that
+  # publish by-hash, and a separate cache location from the plain name.
+  if [[ "${host}" == archive.ubuntu.com || "${host}" == deb.debian.org ]]; then
+    got="$(curl -fsS --max-time 60 "${RESOLVE[@]}" "$(apt_url "${name}" "$(dir_of "${suite}")${path%/*}/by-hash/SHA256/${sha}")" 2>/dev/null | sha256sum | cut -d' ' -f1)" || got=""
+    if [[ "${got}" == "${sha}" ]]; then printf '  ok    %-30s sha256 matches\n' "apt  ${host%%.*} by-hash"
+    else printf '  FAIL  %-30s sha256 mismatch  (%s)\n' "apt  ${host%%.*} by-hash" "${name}"; failed=$((failed + 1)); fi
+  fi
+done
+
+# What apt-nginx refuses. The unknown name goes straight to apt-nginx, since
+# Caddy answers it itself.
+code="$(direct_status /repository/no-such-repo/InRelease)"
+if [[ "${code}" == "404" ]]; then printf '  ok    %-30s %s\n' "apt  refuses unknown repo" "${code}"
+else printf '  FAIL  %-30s %s\n' "apt  refuses unknown repo" "${code}"; failed=$((failed + 1)); fi
+check "apt  refuses non-index path" '^404$' "$(apt_url ubuntu-noble ls-lR.gz)" "${RESOLVE[@]}"
+check "apt  refuses a query string" '^400$' "$(apt_url ubuntu-noble dists/noble/InRelease)?x" "${RESOLVE[@]}"
+check "apt  refuses POST" '^405$' "$(apt_url ubuntu-noble dists/noble/InRelease)" -X POST "${RESOLVE[@]}"
+
+# Warnings only: nothing here means the mirror is broken, but each is worth
+# knowing on a deploy.
+#
+# A served index much older than upstream's means apt-nginx is answering from
+# its stale copy -- the upstream is failing for it, and nodes are not getting
+# updates. Upstream is fetched first so a publish in between cannot look like lag.
+utc_epoch(){ TZ=UTC date -d "$1" +%s 2>/dev/null || echo 0; }
+date_of(){ awk -F': ' '/^Date: / {print $2; exit}' <<<"$1"; }
+lagging=0; compared=0
+for entry in "${APT_REPOS[@]}"; do
+  IFS='|' read -r name host base suite <<<"${entry}"
+  up="$(curl -fsSL --max-time 30 "https://${host}${base}/$(index_of "${suite}")" 2>/dev/null)" || continue
+  ours="$(curl -fsS --max-time 30 "${RESOLVE[@]}" "$(apt_url "${name}" "$(index_of "${suite}")")" 2>/dev/null)" || continue
+  up_t="$(utc_epoch "$(date_of "${up}")")"; our_t="$(utc_epoch "$(date_of "${ours}")")"
+  [[ "${up_t}" -gt 0 && "${our_t}" -gt 0 ]] && compared=$((compared + 1))
+  if [[ "${up_t}" -gt 0 && "${our_t}" -gt 0 && $((up_t - our_t)) -gt 3600 ]]; then
+    warn "apt  ${name}" "served index is $(( (up_t - our_t) / 60 )) min older than upstream"
+    lagging=$((lagging + 1))
+  fi
+done
+if [[ "${compared}" -eq 0 ]]; then warn "apt  freshness" "no index could be compared with upstream"
+elif [[ "${lagging}" -eq 0 ]]; then printf '  ok    %-30s %s indexes within 1h of upstream\n' "apt  freshness" "${compared}"; fi
+
+# nginx skips an unresponsive address for 10s, which only helps a host that has
+# another one to fall back to.
+for host in "${apt_hosts[@]}"; do
+  n="$(getent ahostsv4 "${host}" | awk '{print $1}' | sort -u | wc -l)" || n=0
+  [[ "${n}" -ge 2 ]] || warn "apt  ${host}" "resolves to ${n} IPv4 address(es); no failover"
+done
 check "helm helm-tigera" '^200$' "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"
 check "helm helm-metrics-server" '^200$' "https://${BASE_DOMAIN}/repository/helm-metrics-server/index.yaml"
 # The chart URLs in an index must point back here, not at GitHub. A Helm client
@@ -1042,14 +1473,6 @@ else
   printf '  FAIL  %-30s index served, but chart urls still point upstream\n' "helm url rewrite"
   failed=$((failed + 1))
 fi
-
-# Check keys by content: a redirect to an HTML page also returns 200.
-check_pgp(){ # label, url
-  local label="$1" url="$2" body
-  body="$(curl -fsS --max-time 45 "${url}" 2>/dev/null)" || body=""
-  if [[ "${body}" == "-----BEGIN PGP"* ]]; then printf '  ok    %-30s pgp key\n' "${label}"
-  else printf '  FAIL  %-30s not a pgp key  (%s)\n' "${label}" "${url}"; failed=$((failed + 1)); fi
-}
 
 check_pgp "raw  raw-docker gpg" "https://${BASE_DOMAIN}/repository/raw-docker/linux/ubuntu/gpg"
 check "raw  raw-k8s" '^200$' "https://${BASE_DOMAIN}/repository/raw-k8s/release/stable.txt"
@@ -1095,7 +1518,7 @@ cat <<EOF
 
 Done on ${BASE_DOMAIN}.
 
-  12 Remap entries, 7 registry containers (${REGISTRY_IMAGE%@*}),
+  ${#APT_REPOS[@]} apt repositories via apt-nginx, 7 registry containers (${REGISTRY_IMAGE%@*}),
   ${#HELM_REPOS[@]} helm + ${#RAW_REPOS[@]} raw via nginx.
   No licence meter, no admin user, no EULA, no realm.
 

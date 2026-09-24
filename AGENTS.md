@@ -90,12 +90,15 @@ config serving on every rerun. Write config files in place (`> file`); `cp`,
 `mv` or `sed -i` replace the inode and the running container keeps the old one.
 
 **`nginx -t` passing does not mean the reload worked.** A changed cache zone
-(`levels=`, path, zone name) passes `nginx -t`, and the running master then
-refuses the reload with `[emerg]` in its log while the old config keeps serving.
-So each nginx service carries a `mirror.cache-zones` label with a hash of its
-`proxy_cache_path` lines: a zone change changes the compose definition and `up
--d` recreates the container. Keep `proxy_cache_path` directives ending in `;`
-(the hash reads from the directive to its semicolon).
+(`levels=` or path) passes `nginx -t`, and the running master then refuses the
+reload with `[emerg]` in its log while the old config keeps serving. So each
+nginx service carries a `mirror.cache-zones` label with a hash of its
+`proxy_cache_path` directives: any change to one (including `max_size` and
+`min_free`, so `APT_CACHE_*` and `NGINX_CACHE_MAX_SIZE`) changes the compose
+definition and `up -d` recreates the container. That recreate happens before
+`nginx -t`, so a bad config shipped together with a zone change crash-loops
+instead of being refused. Keep `proxy_cache_path` directives ending in `;` (the
+hash reads from the directive to its semicolon).
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
 answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests
@@ -216,8 +219,7 @@ explains itself.
 ## Adding a repository
 
 Each kind lives in one table near the top of `install-mirror-stack.sh`. An APT
-row is `name|host|base path|suite` (empty suite for a flat repository such as
-kubernetes). Rows with the same host and base share one cache, which is what
-lets the `ubuntu-*` suites share a pool. A new host gets its own `upstream`
+row is `name|host|base path`. Rows with the same host and base share one
+cache, which is what lets the `ubuntu-*` suites share a pool. A new host gets its own `upstream`
 block and allow-list entry automatically; an upstream that redirects anywhere
 other than `*.cloudfront.net` will be refused.

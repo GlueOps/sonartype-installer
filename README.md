@@ -204,8 +204,9 @@ still served when the upstream errors or times out. Revalidation sends only
 `If-Modified-Since`, so a lagging mirror answers 304 instead of replacing a newer
 copy with an older one.
 
-**Packages, `by-hash` and pdiffs never change**, so they are cached for good and
-fetched in 1 MB slices: thirteen nodes asking for the same cold package cause one
+**Packages, `by-hash` and pdiffs never change**, so they are never revalidated:
+kept until evicted (unused for 45 days, or the size cap) and fetched in 1 MB
+slices: thirteen nodes asking for the same cold package cause one
 upstream fetch per slice, and each receives bytes as its slice lands. The cache
 key is the upstream host and path, so the nine `ubuntu-*` repositories share one
 copy of the pool.
@@ -217,9 +218,11 @@ in the table and verifies their certificates, and follows a redirect only to
 `*.cloudfront.net`, checked on every hop.
 
 **Sizes.** `APT_CACHE_MAX_SIZE` (default 40g) caps the package cache and
-`APT_CACHE_MIN_FREE` (default 10g) is disk it always leaves free, since the
+`APT_CACHE_MIN_FREE` (default 10g) is free disk nginx evicts to keep, since the
 registries share the disk. Indexes have their own 10g zone, so package churn
-cannot evict what an outage depends on.
+cannot evict what an outage depends on. Changing either size recreates the
+apt-nginx container (nginx cannot reload a cache zone), so apt is unavailable
+for a few seconds on that run.
 
 Runbooks:
 

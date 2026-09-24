@@ -129,9 +129,7 @@ OFFICIAL_NAMESPACE=(
   "dockerhub:library"
 )
 
-# name|upstream host|upstream base path|suite -- served by apt-nginx over https.
-# The suite is only used by the post-deploy checks; empty means a flat
-# repository (InRelease next to Packages, no dists/).
+# name|upstream host|upstream base path -- served by apt-nginx over https.
 #
 # Prefixes that share a host and base share one cache: the nine ubuntu-*
 # repositories have one pool/, so a .deb fetched through one is a hit through
@@ -141,39 +139,39 @@ OFFICIAL_NAMESPACE=(
 # spelling -- a percent-encoded %3a path was served month-old indexes.
 # packages.buildkite.com answers every path with a 302 to signed CloudFront.
 APT_REPOS=(
-  "ubuntu-jammy|archive.ubuntu.com|/ubuntu|jammy"
-  "ubuntu-jammy-updates|archive.ubuntu.com|/ubuntu|jammy-updates"
-  "ubuntu-jammy-security|archive.ubuntu.com|/ubuntu|jammy-security"
-  "ubuntu-noble|archive.ubuntu.com|/ubuntu|noble"
-  "ubuntu-noble-updates|archive.ubuntu.com|/ubuntu|noble-updates"
-  "ubuntu-noble-security|archive.ubuntu.com|/ubuntu|noble-security"
-  "ubuntu-resolute|archive.ubuntu.com|/ubuntu|resolute"
-  "ubuntu-resolute-updates|archive.ubuntu.com|/ubuntu|resolute-updates"
-  "ubuntu-resolute-security|archive.ubuntu.com|/ubuntu|resolute-security"
-  "debian-bookworm|deb.debian.org|/debian|bookworm"
-  "debian-bookworm-updates|deb.debian.org|/debian|bookworm-updates"
-  "debian-bookworm-security|security.debian.org|/debian-security|bookworm-security"
-  "debian-trixie|deb.debian.org|/debian|trixie"
-  "debian-trixie-updates|deb.debian.org|/debian|trixie-updates"
-  "debian-trixie-security|security.debian.org|/debian-security|trixie-security"
-  "kubernetes-v1-32|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.32/deb|"
-  "kubernetes-v1-33|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.33/deb|"
-  "kubernetes-v1-34|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.34/deb|"
-  "kubernetes-v1-35|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.35/deb|"
-  "kubernetes-v1-36|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.36/deb|"
-  "kubernetes-v1-37|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.37/deb|"
-  "docker-ubuntu-jammy|download.docker.com|/linux/ubuntu|jammy"
-  "docker-ubuntu-noble|download.docker.com|/linux/ubuntu|noble"
-  "docker-ubuntu-resolute|download.docker.com|/linux/ubuntu|resolute"
-  "docker-debian-bookworm|download.docker.com|/linux/debian|bookworm"
-  "docker-debian-trixie|download.docker.com|/linux/debian|trixie"
-  "helm-apt|packages.buildkite.com|/helm-linux/helm-debian/any|any"
+  "ubuntu-jammy|archive.ubuntu.com|/ubuntu"
+  "ubuntu-jammy-updates|archive.ubuntu.com|/ubuntu"
+  "ubuntu-jammy-security|archive.ubuntu.com|/ubuntu"
+  "ubuntu-noble|archive.ubuntu.com|/ubuntu"
+  "ubuntu-noble-updates|archive.ubuntu.com|/ubuntu"
+  "ubuntu-noble-security|archive.ubuntu.com|/ubuntu"
+  "ubuntu-resolute|archive.ubuntu.com|/ubuntu"
+  "ubuntu-resolute-updates|archive.ubuntu.com|/ubuntu"
+  "ubuntu-resolute-security|archive.ubuntu.com|/ubuntu"
+  "debian-bookworm|deb.debian.org|/debian"
+  "debian-bookworm-updates|deb.debian.org|/debian"
+  "debian-bookworm-security|security.debian.org|/debian-security"
+  "debian-trixie|deb.debian.org|/debian"
+  "debian-trixie-updates|deb.debian.org|/debian"
+  "debian-trixie-security|security.debian.org|/debian-security"
+  "kubernetes-v1-32|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.32/deb"
+  "kubernetes-v1-33|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.33/deb"
+  "kubernetes-v1-34|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.34/deb"
+  "kubernetes-v1-35|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.35/deb"
+  "kubernetes-v1-36|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.36/deb"
+  "kubernetes-v1-37|prod-cdn.packages.k8s.io|/repositories/isv:/kubernetes:/core:/stable:/v1.37/deb"
+  "docker-ubuntu-jammy|download.docker.com|/linux/ubuntu"
+  "docker-ubuntu-noble|download.docker.com|/linux/ubuntu"
+  "docker-ubuntu-resolute|download.docker.com|/linux/ubuntu"
+  "docker-debian-bookworm|download.docker.com|/linux/debian"
+  "docker-debian-trixie|download.docker.com|/linux/debian"
+  "helm-apt|packages.buildkite.com|/helm-linux/helm-debian/any"
 )
 
 # The route names, and each distinct upstream host once.
 apt_names=(); apt_hosts=()
 for entry in "${APT_REPOS[@]}"; do
-  IFS='|' read -r name host _ _ <<<"${entry}"
+  IFS='|' read -r name host _ <<<"${entry}"
   apt_names+=("${name}")
   [[ " ${apt_hosts[*]} " == *" ${host} "* ]] || apt_hosts+=("${host}")
 done
@@ -388,7 +386,7 @@ NGINX
         default "";
 NGINX
   for entry in "${APT_REPOS[@]}"; do
-    IFS='|' read -r name host base _ <<<"${entry}"
+    IFS='|' read -r name host base <<<"${entry}"
     printf '        ~^/repository/%-28s %s%s;\n' "${name}/" "${host}" "${base}"
   done
   cat <<'NGINX'
@@ -789,7 +787,7 @@ log "Writing landing page"
   done
   echo "</ul><h2>APT (${#APT_REPOS[@]})</h2><ul>"
   for entry in "${APT_REPOS[@]}"; do
-    IFS='|' read -r name host base _ <<<"${entry}"
+    IFS='|' read -r name host base <<<"${entry}"
     echo "<li><code>/repository/${name}/</code> &rarr; https://${host}${base}</li>"
   done
   echo "</ul><h2>Helm</h2><ul>"

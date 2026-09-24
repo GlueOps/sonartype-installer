@@ -284,20 +284,6 @@ thing on disk and is safe to remove once the new stack has proven itself:
 fi
 
 log "Preparing ${STACK_DIR}"
-# First run with apt-nginx: its cache is new, and on an upgraded host the old
-# apt-cacher-ng cache (apt-cache/) is left in place, so say how much room there is.
-# min_free means nginx never fills the disk; with less room the cache just holds less.
-if [[ "${DRY_RUN}" != "1" && ! -d "${STACK_DIR}/apt-nginx-cache" && -d "$(dirname "${STACK_DIR}")" ]]; then
-  to_mb() { local n="${1%?}"; case "${1: -1}" in k|K) echo $((n / 1024)) ;; m|M) echo "${n}" ;; g|G) echo $((n * 1024)) ;; esac; }
-  want_mb=$(( $(to_mb "${APT_CACHE_MAX_SIZE}") + $(to_mb "${APT_CACHE_MIN_FREE}") ))
-  free_mb="$(df -Pm "$(dirname "${STACK_DIR}")" | awk 'NR==2 {print $4}')"
-  if [[ -n "${free_mb}" && "${free_mb}" -lt "${want_mb}" ]]; then
-    echo "    WARNING: ${free_mb}MB free, the apt cache can use up to ${APT_CACHE_MAX_SIZE} plus ${APT_CACHE_MIN_FREE} kept free."
-    [[ -d "${STACK_DIR}/apt-cache" ]] && \
-      echo "    The old apt-cacher-ng cache is no longer used: $(du -sh "${STACK_DIR}/apt-cache" 2>/dev/null | cut -f1) in ${STACK_DIR}/apt-cache"
-  fi
-fi
-
 mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-nginx-cache,registries,content-cache,content-log}
 mkdir -p "${STACK_DIR}/site"
 for entry in "${REGISTRIES[@]}"; do

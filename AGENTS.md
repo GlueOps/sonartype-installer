@@ -176,6 +176,11 @@ test failed without it:
   client gets a hole with a correct length (every version since 1.9.8). Closing
   the connection makes Caddy abort, and without `Last-Modified` apt's automatic
   retry fetches the whole file rather than resuming into the hole.
+- **The fetch tier's `location /` and `@apt_follow` retry the next address on 404 and
+  5xx.** archive.ubuntu.com's addresses drift apart for hours: a lagging one 404s a
+  package or by-hash file the index already lists, and with slicing a 404 on a later
+  slice truncates the download. Not on `/idx/`: there a lagging address returns an
+  older file, not a 404.
 - **Hidden `ETag`** on sliced locations, or one upstream ETag change breaks that
   file permanently.
 - **`volatile` on `$apt_nocache`/`$apt_empty`.** Slice subrequests share the

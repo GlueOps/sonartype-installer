@@ -544,7 +544,11 @@ NGINX
         proxy_ignore_headers X-Accel-Redirect X-Accel-Expires X-Accel-Limit-Rate X-Accel-Buffering X-Accel-Charset;
         error_page 301 302 303 307 308 = @apt_follow;
 
+        # Packages, by-hash and pdiffs have immutable names, so a 404 from one upstream
+        # address means that address is behind (archive.ubuntu.com's addresses drift
+        # apart for hours): try the next one. apt retries neither a 404 nor a 5xx.
         location / {
+            proxy_next_upstream error timeout http_404 http_500 http_502 http_503 http_504 http_429;
             if ($fetch_scheme = "") { return 403; }
             proxy_set_header Host $fetch_host;
             proxy_set_header Connection "";
@@ -563,6 +567,7 @@ NGINX
         }
 
         location @apt_follow {
+            proxy_next_upstream error timeout http_404 http_500 http_502 http_503 http_504 http_429;
             # an `if`, not a map: a map is evaluated once per request, so hop 2+ would reuse hop 1's verdict
             if ($upstream_http_location !~ "^https://[a-z0-9]+\.cloudfront\.net/") { return 502; }
             set $apt_redirect $upstream_http_location;

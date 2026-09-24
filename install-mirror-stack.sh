@@ -1026,6 +1026,13 @@ chmod 0755 "${STACK_DIR}/registry-upstream-creds"
 # Compose
 # ---------------------------------------------------------------------------
 log "Writing docker-compose.yml"
+# nginx cannot reload a changed cache zone (path, levels=, keys_zone): it keeps
+# the old config and logs [emerg]. A label carrying a hash of those lines makes
+# compose recreate the container when they change; everything else is reloaded.
+cache_zones_label() {
+  echo "    labels:"
+  echo "      - mirror.cache-zones=$(awk '/^[[:space:]]*proxy_cache_path/,/;/' "$1" | sha256sum | cut -c1-16)"
+}
 # Docker's json-file logs grow without limit unless capped.
 compose_logging() {
   echo "    logging:"
@@ -1063,6 +1070,7 @@ compose_logging() {
   echo "    image: ${NGINX_IMAGE}"
   echo "    container_name: content-cache"
   echo "    restart: unless-stopped"
+  cache_zones_label "${STACK_DIR}/nginx.conf"
   echo "    volumes:"
   echo "      - ${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro"
   echo "      - ${STACK_DIR}/content-cache:/var/cache/nginx"
@@ -1078,6 +1086,7 @@ compose_logging() {
   echo "    image: ${NGINX_IMAGE}"
   echo "    container_name: apt-nginx"
   echo "    restart: unless-stopped"
+  cache_zones_label "${STACK_DIR}/apt-nginx.conf"
   compose_logging
   echo "    # One file descriptor per 1 MB slice in flight; the default runs out under"
   echo "    # a cold bootstrap wave and nginx then truncates responses."

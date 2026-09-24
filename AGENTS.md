@@ -92,8 +92,10 @@ config serving on every rerun. Write config files in place (`> file`); `cp`,
 **`nginx -t` passing does not mean the reload worked.** A changed cache zone
 (`levels=`, path, zone name) passes `nginx -t`, and the running master then
 refuses the reload with `[emerg]` in its log while the old config keeps serving.
-The script only reloads, so after such a change run `docker compose restart
-<service>` by hand.
+So each nginx service carries a `mirror.cache-zones` label with a hash of its
+`proxy_cache_path` lines: a zone change changes the compose definition and `up
+-d` recreates the container. Keep `proxy_cache_path` directives ending in `;`
+(the hash reads from the directive to its semicolon).
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public
 answers `HEAD` on a blob with 401 and the proxy HEADs every blob, so manifests

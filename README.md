@@ -208,8 +208,8 @@ copy with an older one.
 kept until evicted (unused for 45 days, or the size cap) and fetched in 1 MB
 slices: thirteen nodes asking for the same cold package cause one
 upstream fetch per slice, and each receives bytes as its slice lands. The cache
-key is the upstream host and path, so the nine `ubuntu-*` repositories share one
-copy of the pool.
+key is the upstream host and path, so the six `ubuntu-*` release and `-updates`
+repositories share one copy of the pool; the three `-security` ones share another.
 
 **What it refuses.** Only the repositories in `APT_REPOS`, only index and package
 paths, only `GET`/`HEAD` without a body, no query strings and no escapes other

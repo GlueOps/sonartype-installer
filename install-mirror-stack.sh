@@ -275,7 +275,8 @@ To reclaim space:
 On a host already migrated, the stopped Nexus stack is usually the largest
 thing on disk and is safe to remove once the new stack has proven itself:
   rm -rf /opt/nexus ${OLD_STACK_DIR}
-On a host that ran apt-cacher-ng, its old cache is left in place too:
+On a host that ran apt-cacher-ng, its old cache is left in place too, and is
+safe to remove once apt-nginx is serving:
   rm -rf ${STACK_DIR}/apt-cache ${STACK_DIR}/apt-log"
     fi
   done
@@ -1181,7 +1182,7 @@ log "Checking the nginx configs"
 docker run --rm --network none -v "${STACK_DIR}/apt-nginx.conf:/etc/nginx/nginx.conf:ro" "${NGINX_IMAGE}" \
   sh -c 'mkdir -p /var/cache/apt-nginx && nginx -t -q' \
   || die "apt-nginx.conf is invalid; nothing has been stopped or restarted"
-docker run --rm --network none -v "${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro" "${NGINX_IMAGE}" nginx -t -q \
+docker run --rm --network none --entrypoint nginx -v "${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro" "${NGINX_IMAGE}" -t -q \
   || die "nginx.conf is invalid; nothing has been stopped or restarted"
 
 if [[ -f "${OLD_STACK_DIR}/docker-compose.yml" ]]; then
@@ -1288,6 +1289,7 @@ done
 echo
 log "Public checks over TLS"
 check "apt  ubuntu-noble" '^200$' "https://${BASE_DOMAIN}/repository/ubuntu-noble/dists/noble/InRelease"
+check "apt  ubuntu-noble-security" '^200$' "https://${BASE_DOMAIN}/repository/ubuntu-noble-security/dists/noble-security/InRelease"
 check "apt  debian-trixie" '^200$' "https://${BASE_DOMAIN}/repository/debian-trixie/dists/trixie/InRelease"
 check "apt  kubernetes-v1-34" '^200$' "https://${BASE_DOMAIN}/repository/kubernetes-v1-34/Release"
 check "helm helm-tigera" '^200$' "https://${BASE_DOMAIN}/repository/helm-tigera/index.yaml"

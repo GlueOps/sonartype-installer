@@ -15,3 +15,46 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run shellcheck
         run: shellcheck --severity=warning install.sh install-mirror-stack.sh
+
+  # Generates every config the installer writes, in both site shapes, and checks
+  # each one with the tool that will load it.
+  dry-run:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Generate both shapes
+        run: |
+          DRY_RUN=1 STACK_DIR="$RUNNER_TEMP/r" ACME_EMAIL=ci@example.com \
+            bash install-mirror-stack.sh repo.example.com
+          DRY_RUN=1 STACK_DIR="$RUNNER_TEMP/g" ACME_EMAIL=ci@example.com GLOBAL_BASE_DOMAIN=repo.example.org \
+            bash install-mirror-stack.sh repo.example.com
+      - name: Check the generated files
+        run: |
+          for d in r g; do
+            # shellcheck disable=SC2016 # a literal ${ is what is being looked for
+            if grep -nF '${' "$RUNNER_TEMP/$d/apt-nginx.conf"; then exit 1; fi
+            test "$(grep -cE '^ +~\^/repository/[a-z0-9-]+/ +[a-z]' "$RUNNER_TEMP/$d/apt-nginx.conf")" -eq 27
+            docker compose -f "$RUNNER_TEMP/$d/docker-compose.yml" config --quiet
+          done
+          test "$(grep -cE '^[a-z0-9][a-z0-9.-]* \{$' "$RUNNER_TEMP/r/Caddyfile")" -eq 8
+          test "$(grep -cE '^[a-z0-9][a-z0-9.-]* \{$' "$RUNNER_TEMP/g/Caddyfile")" -eq 16
+      - name: nginx -t, offline
+        run: |
+          img="$(awk '$1 == "image:" && $2 ~ /^nginx:/ {print $2; exit}' "$RUNNER_TEMP/r/docker-compose.yml")"
+          docker run --rm --network none -v "$RUNNER_TEMP/r/apt-nginx.conf:/etc/nginx/nginx.conf:ro" "$img" \
+            sh -c 'mkdir -p /var/cache/apt-nginx && nginx -t'
+          docker run --rm --network none -v "$RUNNER_TEMP/r/nginx.conf:/etc/nginx/nginx.conf:ro" "$img" nginx -t
+      - name: caddy validate
+        run: |
+          img="$(awk '$1 == "image:" && $2 ~ /^caddy:/ {print $2; exit}' "$RUNNER_TEMP/r/docker-compose.yml")"
+          # The global shape loads a pre-issued wildcard; any pair will do here.
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=repo.example.org \
+            -keyout "$RUNNER_TEMP/g/certs/repo.example.org.key" -out "$RUNNER_TEMP/g/certs/repo.example.org.crt"
+          for d in r g; do
+            docker run --rm -v "$RUNNER_TEMP/$d/Caddyfile:/etc/caddy/Caddyfile:ro" \
+              -v "$RUNNER_TEMP/$d/certs:/certs:ro" "$img" \
+              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          done

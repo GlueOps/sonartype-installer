@@ -37,49 +37,38 @@ sudo BASE_DOMAIN=repo.example.com \
 
 | Was, under Nexus | Is |
 | --- | --- |
-| 27 apt proxy repositories | apt-cacher-ng, **12** `Remap` entries |
+| 27 apt proxy repositories | nginx (`apt-nginx`), 7 upstream hosts (below) |
 | 7 docker proxy repositories | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
 | 4 helm + 6 raw proxy repositories | nginx cache behind Caddy |
 | Nexus UI | a static index of what the host serves, plus `/healthz` |
 
 No admin user, no EULA, and no *Docker Bearer Token Realm* to switch on by hand
 after every rebuild. Client URLs are unchanged: `/repository/<name>/` is a Nexus
-path convention, but apt-cacher-ng's `Remap` and Caddy's `handle_path` reproduce
-it verbatim, so no `sources.list` or `helm repo add` in your estate has to move.
+path convention, but the generated nginx and Caddy routes reproduce it verbatim,
+so no `sources.list` or `helm repo add` in your estate has to move.
 
 Every cache is plain local disk. Upstream is explicit that a pull-through
-registry cache uses the `filesystem` storage driver; helm and raw cache in
+registry cache uses the `filesystem` storage driver; apt, helm and raw cache in
 `nginx:alpine` behind Caddy, which stays the stock `caddy:2` image.
 
 ### Retention
 
 | layer | setting | effect |
 | --- | --- | --- |
-| apt-cacher-ng | `ExThreshold: 45` | 45 days before an unreferenced file is expired |
+| apt-nginx (packages) | `inactive=45d` + `APT_CACHE_MAX_SIZE` (40g) | LRU; a file unused for 45 days is dropped |
+| apt-nginx (indexes) | `1s`, revalidated, stale on error | fresh on every `apt-get update`, last good copy in an outage |
 | nginx (raw) | always revalidate, stale on error | those are stable paths whose *content moves* |
 | nginx (helm index) | `5m` | an index is the thing that moves |
 | nginx (eviction) | `inactive=365d` + `max_size` | LRU, disk pressure only |
 | registries | `REGISTRY_PROXY_TTL=0` | never deleted |
 
-The packaged apt-cacher-ng default is `ExThreshold: 4`, and its own docs warn
-that a low value plus an index unavailable for a few days risks deleting
-still-useful package files — a mirror outage being precisely the case this cache
-exists for. At 45 an outage has to last six weeks before the cache erodes.
-
 Retention is not freshness. Raising the *freshness* window on raw would be a
 regression: `dl.k8s.io/release/stable.txt` and friends are stable paths whose
 content moves, which is why they revalidate on every request.
 
-**`Offlinemode` is not a retention setting and must not be left on.** It forbids
-outgoing connections entirely: indexes never refresh, security updates never
-arrive, and any package not already cached returns 503 — verified against a
-*healthy* upstream, not just an unreachable one. apt-cacher-ng has no
-stale-on-error fallback; this is a mode switch, not a policy. If you want it
-during an incident, set it, restart `apt-cache`, and **unset it afterwards**.
-
 ### Nothing is stopped until everything is in hand
 
-Images are **built and pulled before the current stack is touched**. `docker
+Images are **pulled before the current stack is touched**. `docker
 compose up` otherwise fetches what it lacks *after* the teardown, so an
 unreachable registry, an expired credential or a withdrawn tag becomes an outage
 rather than a refusal.
@@ -103,8 +92,23 @@ If a stack built by `install.sh` is present, it is **stopped, not deleted**, and
 its TLS material is carried across first. Rollback is a compose up in the old
 stack directory. On a host with no Nexus, that phase is skipped entirely.
 
-Images are built *before* anything is stopped, so a failed build is not an
-outage. `DRY_RUN=1` writes the compose file, Caddyfile and `acng.conf` and stops.
+Images are pulled *before* anything is stopped, so a failed pull is not an
+outage. `DRY_RUN=1` writes the compose file, Caddyfile, `nginx.conf` and
+`apt-nginx.conf` and stops.
+
+### Upgrading a host that ran apt-cacher-ng
+
+One run switches it over; nothing else is needed.
+
+- The `apt-cache` container is removed (it is no longer in the compose file, and
+  the run uses `--remove-orphans`). Its cache in `apt-cache/` and `apt-log/`,
+  `acng.conf`, `Dockerfile.acng` and its locally built image are **left in
+  place**; delete them when convenient. Nothing uses them.
+- apt is unavailable for a few seconds during the switch.
+- Caddy and content-cache are recreated once (a new sysctl and a pinned nginx
+  image), so every route blips for a moment on that first run.
+- The apt cache starts cold. Indexes and packages are fetched on first use; a
+  package that was never fetched is not available while its upstream is down.
 
 ### Two things that will bite you
 
@@ -116,12 +120,12 @@ outage. `DRY_RUN=1` writes the compose file, Caddyfile and `acng.conf` and stops
 regional names a certificate that does not match. The generated Caddyfile keeps
 them apart: regional on ACME, global on the pre-issued wildcard.
 
-**`X-Forwarded-*` is stripped from helm and raw upstream requests.** Those are
-third-party CDNs being fetched as an ordinary client, which is what Nexus did.
-`packages.buildkite.com` is the proof: it answers a request carrying
+**`X-Forwarded-*` is stripped from apt, helm and raw upstream requests.** Those
+are third-party CDNs being fetched as an ordinary client, which is what Nexus
+did. `packages.buildkite.com` is the proof: it answers a request carrying
 `X-Forwarded-Host` with a 301 to its marketing site instead of the signed URL
-for the signing key. The registry and apt routes keep their headers; those
-backends are yours.
+for the signing key. The registry routes keep their headers; those backends are
+yours.
 
 ### Registries run `ghcr.io/glueops/registry`
 
@@ -177,6 +181,61 @@ serving, and how much" answerable.
 The roll limits matter: Caddy defaults to 100MiB × 10 per log and this stack
 writes several of them, so the default ceiling is gigabytes of logs on a host
 whose whole job is caching.
+
+### APT goes through nginx
+
+`apt-nginx` replaces apt-cacher-ng, which truncated a response whenever several
+nodes refreshed the same expired index at once, failed every index with 503
+while an upstream was down, and percent-encoded the colons in `pkgs.k8s.io`
+paths into a spelling CloudFront served month-old indexes for.
+
+**Two tiers in one container.** `:3142` caches: keys, 1 MB slices, locks and
+stale copies. A loopback server on `127.0.0.1:8091` fetches: DNS, TLS
+verification, keepalive and redirect following, and it never caches. They must
+stay apart: a slice subrequest that follows a redirect loses its `Range` and
+splices a whole body into the file.
+
+**Indexes are cached for 1s and revalidated by date.** `InRelease`, `Packages`
+and the rest are rewritten in place on every publish, and apt fails with `File
+has unexpected size` when it gets an `InRelease` and a `Packages` from different
+publishes. A short lifetime, no background refresh and no `updating` in
+`proxy_cache_use_stale` keep them from the same publish; the last good copy is
+still served when the upstream errors or times out. Revalidation sends only
+`If-Modified-Since`, so a lagging mirror answers 304 instead of replacing a newer
+copy with an older one.
+
+**Packages, `by-hash` and pdiffs never change**, so they are never revalidated:
+kept until evicted (unused for 45 days, or the size cap) and fetched in 1 MB
+slices: thirteen nodes asking for the same cold package cause one
+upstream fetch per slice, and each receives bytes as its slice lands. The cache
+key is the upstream host and path, so the six `ubuntu-*` release and `-updates`
+repositories share one copy of the pool; the three `-security` ones share another.
+
+**What it refuses.** Only the repositories in `APT_REPOS`, only index and package
+paths, only `GET`/`HEAD` without a body, no query strings and no escapes other
+than the `%7e`/`%2b` apt itself sends. The fetch tier talks only to the seven hosts
+in the table and verifies their certificates, and follows a redirect only to
+`*.cloudfront.net`, checked on every hop.
+
+**Sizes.** `APT_CACHE_MAX_SIZE` (default 40g) caps the package cache and
+`APT_CACHE_MIN_FREE` (default 10g) is free disk nginx evicts to keep, since the
+registries share the disk. Indexes have their own 10g zone, so package churn
+cannot evict what an outage depends on. Changing either size recreates the
+apt-nginx container (nginx cannot reload a cache zone), so apt is unavailable
+for a few seconds on that run.
+
+Runbooks:
+
+- **One cached file is bad.** Delete every slice of it; the next request refetches:
+  ```sh
+  grep -rlaF "KEY: archive.ubuntu.com/ubuntu/pool/main/h/hello/hello_2.10-3build1_amd64.deb" \
+    /opt/mirror-stack/apt-nginx-cache | xargs -r rm -f
+  ```
+- **A Debian `-updates`/`-security` suite is expired.** Those suites carry
+  `Valid-Until` seven days out, so after about a week of upstream outage apt
+  refuses the cached copy. That needs a change on the nodes, not the mirror:
+  `Acquire::Check-Valid-Until "false";` in `/etc/apt/apt.conf.d/`, removed afterwards.
+- **A new Kubernetes minor.** Add its row to `APT_REPOS` and re-run.
 
 ### Helm and raw go through nginx
 

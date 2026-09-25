@@ -15,7 +15,7 @@
 # the Nexus stack, and is kept for deployments that stay under the limits.
 #
 # WHAT IT BUILDS
-#   27 apt suites       -> nginx (apt-nginx), 6 upstream hosts
+#   27 apt suites       -> nginx (apt-nginx), 7 upstream hosts
 #    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
 #                          upstream (see REGISTRY_IMAGE)
 #    4 helm + 6 raw     -> nginx cache behind Caddy
@@ -131,9 +131,11 @@ OFFICIAL_NAMESPACE=(
 
 # name|upstream host|upstream base path -- served by apt-nginx over https.
 #
-# Prefixes that share a host and base share one cache: the nine ubuntu-*
-# repositories have one pool/, so a .deb fetched through one is a hit through
-# the others. debian-security is a separate archive with its own pool/.
+# Prefixes that share a host and base share one cache: the six ubuntu-* release
+# and -updates repositories have one pool/, so a .deb fetched through one is a
+# hit through the others. -security comes from security.ubuntu.com, as in
+# Ubuntu's own sources, and debian-security is a separate archive: each has its
+# own cache.
 # kubernetes goes to prod-cdn.packages.k8s.io directly with literal colons:
 # pkgs.k8s.io only redirects there, and CloudFront keys its cache on the exact
 # spelling -- a percent-encoded %3a path was served month-old indexes.
@@ -141,13 +143,13 @@ OFFICIAL_NAMESPACE=(
 APT_REPOS=(
   "ubuntu-jammy|archive.ubuntu.com|/ubuntu"
   "ubuntu-jammy-updates|archive.ubuntu.com|/ubuntu"
-  "ubuntu-jammy-security|archive.ubuntu.com|/ubuntu"
+  "ubuntu-jammy-security|security.ubuntu.com|/ubuntu"
   "ubuntu-noble|archive.ubuntu.com|/ubuntu"
   "ubuntu-noble-updates|archive.ubuntu.com|/ubuntu"
-  "ubuntu-noble-security|archive.ubuntu.com|/ubuntu"
+  "ubuntu-noble-security|security.ubuntu.com|/ubuntu"
   "ubuntu-resolute|archive.ubuntu.com|/ubuntu"
   "ubuntu-resolute-updates|archive.ubuntu.com|/ubuntu"
-  "ubuntu-resolute-security|archive.ubuntu.com|/ubuntu"
+  "ubuntu-resolute-security|security.ubuntu.com|/ubuntu"
   "debian-bookworm|deb.debian.org|/debian"
   "debian-bookworm-updates|deb.debian.org|/debian"
   "debian-bookworm-security|security.debian.org|/debian-security"
@@ -272,7 +274,9 @@ To reclaim space:
   du -sh /opt/* /var/lib/docker/* 2>/dev/null | sort -h | tail
 On a host already migrated, the stopped Nexus stack is usually the largest
 thing on disk and is safe to remove once the new stack has proven itself:
-  rm -rf /opt/nexus ${OLD_STACK_DIR}"
+  rm -rf /opt/nexus ${OLD_STACK_DIR}
+On a host that ran apt-cacher-ng, its old cache is left in place too:
+  rm -rf ${STACK_DIR}/apt-cache ${STACK_DIR}/apt-log"
     fi
   done
 fi
@@ -580,6 +584,7 @@ NGINX
 
         location @apt_follow_idx {
             proxy_read_timeout 7s;
+            error_page 301 302 303 307 308 = @apt_follow_idx;   # else hop 2+ inherits the server's @apt_follow
             # an `if`, not a map: a map is evaluated once per request, so hop 2+ would reuse hop 1's verdict
             if ($upstream_http_location !~ "^https://[a-z0-9]+\.cloudfront\.net/") { return 502; }
             set $apt_redirect $upstream_http_location;
@@ -1170,6 +1175,15 @@ holds, and an expired one is refused instead of falling back:
 
 Then re-run."
 
+# Refused here, before anything stops or is recreated: up -d would otherwise
+# start a crash-looping nginx on a bad config.
+log "Checking the nginx configs"
+docker run --rm --network none -v "${STACK_DIR}/apt-nginx.conf:/etc/nginx/nginx.conf:ro" "${NGINX_IMAGE}" \
+  sh -c 'mkdir -p /var/cache/apt-nginx && nginx -t -q' \
+  || die "apt-nginx.conf is invalid; nothing has been stopped or restarted"
+docker run --rm --network none -v "${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro" "${NGINX_IMAGE}" nginx -t -q \
+  || die "nginx.conf is invalid; nothing has been stopped or restarted"
+
 if [[ -f "${OLD_STACK_DIR}/docker-compose.yml" ]]; then
   log "Stopping Nexus"
   ( cd "${OLD_STACK_DIR}" && docker compose down --remove-orphans ) || \
@@ -1195,12 +1209,12 @@ docker compose up -d --remove-orphans || die "could not start the stack; apt may
 # files it points at can change without the Caddyfile doing so. Caddy may have
 # just been (re)created, and its admin API takes a moment to listen.
 log "Reloading Caddy"
-for _ in $(seq 1 10); do
-  docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force >/dev/null 2>&1 && break
+for i in $(seq 1 10); do
+  out="$(docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force 2>&1)" && break
+  [[ "${i}" -lt 10 ]] || die "Caddy would not load the new config: ${out}
+check: docker compose -f ${STACK_DIR}/docker-compose.yml logs caddy"
   sleep 1
 done
-docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --force \
-  || die "Caddy would not load the new config -- check: docker compose -f ${STACK_DIR}/docker-compose.yml logs caddy"
 
 # Reloaded every run, not on checksum change: a run that died after writing a
 # config would otherwise leave the old one serving. A just-started nginx has no

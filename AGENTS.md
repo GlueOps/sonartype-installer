@@ -95,9 +95,9 @@ reload with `[emerg]` in its log while the old config keeps serving. So each
 nginx service carries a `mirror.cache-zones` label with a hash of its
 `proxy_cache_path` directives: any change to one (including `max_size` and
 `min_free`, so `APT_CACHE_*` and `NGINX_CACHE_MAX_SIZE`) changes the compose
-definition and `up -d` recreates the container. That recreate happens before
-`nginx -t`, so a bad config shipped together with a zone change crash-loops
-instead of being refused. Keep `proxy_cache_path` directives ending in `;` (the
+definition and `up -d` recreates the container. Both configs are checked with
+`nginx -t` in a throwaway container before `up -d`, so a bad config is refused
+before anything is recreated. Keep `proxy_cache_path` directives ending in `;` (the
 hash reads from the directive to its semicolon).
 
 **Stock `registry:2`/`registry:3` cannot proxy `public.ecr.aws`.** ECR Public

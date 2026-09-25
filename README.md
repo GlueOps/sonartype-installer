@@ -37,7 +37,7 @@ sudo BASE_DOMAIN=repo.example.com \
 
 | Was, under Nexus | Is |
 | --- | --- |
-| 27 apt proxy repositories | nginx (`apt-nginx`), 6 upstream hosts (below) |
+| 27 apt proxy repositories | nginx (`apt-nginx`), 7 upstream hosts (below) |
 | 7 docker proxy repositories | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
 | 4 helm + 6 raw proxy repositories | nginx cache behind Caddy |
 | Nexus UI | a static index of what the host serves, plus `/healthz` |
@@ -213,7 +213,7 @@ copy of the pool.
 
 **What it refuses.** Only the repositories in `APT_REPOS`, only index and package
 paths, only `GET`/`HEAD` without a body, no query strings and no escapes other
-than the `%7e`/`%2b` apt itself sends. The fetch tier talks only to the six hosts
+than the `%7e`/`%2b` apt itself sends. The fetch tier talks only to the seven hosts
 in the table and verifies their certificates, and follows a redirect only to
 `*.cloudfront.net`, checked on every hop.
 

@@ -1,34 +1,19 @@
 #!/usr/bin/env bash
 # Build a caching pull-through mirror for the public container registries, APT
-# suites and Helm charts a Kubernetes cluster pulls from -- without Nexus.
+# suites and Helm charts a Kubernetes cluster pulls from.
 #
 #   sudo BASE_DOMAIN=repo.example.com ACME_EMAIL=admin@example.com \
 #        bash install-mirror-stack.sh
-#
-# WHY THIS EXISTS
-# Nexus Repository Community Edition enforces usage limits from 15 October 2026:
-# 40,000 components OR 100,000 requests per day, and exceeding either blocks
-# *adding new components* until you are under both. For a deployment that is
-# entirely proxy repositories, adding a component is what a cache miss IS -- so
-# going over the request cap does not throttle the mirror, it stops it caching
-# anything it has not already cached. install.sh in this repository still builds
-# the Nexus stack, and is kept for deployments that stay under the limits.
 #
 # WHAT IT BUILDS
 #   27 apt suites       -> nginx (apt-nginx), 7 upstream hosts
 #    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
 #                          upstream (see REGISTRY_IMAGE)
 #    4 helm + 6 raw     -> nginx cache behind Caddy
-# No licence meter, no admin user, no EULA, no realm to switch on by hand.
 #
 # Every cache is plain local disk. Upstream is explicit that a pull-through
 # registry cache uses the filesystem storage driver; apt, helm and raw cache in
 # nginx:alpine, so Caddy stays the stock caddy:2 image.
-#
-# MIGRATING FROM NEXUS
-# If a Nexus stack from install.sh is present, it is STOPPED, NOT DELETED, and
-# its TLS material is carried across first. Rollback is a compose up in the old
-# stack directory. On a host with no Nexus, that whole phase is skipped.
 #
 # REQUIRED
 #   BASE_DOMAIN   the regional hostname, e.g. repo.example.com
@@ -44,7 +29,6 @@
 #   GLOBAL_CERT_NAME    basename of that pre-issued pair. Defaults to
 #                       GLOBAL_BASE_DOMAIN.
 #   STACK_DIR           default /opt/mirror-stack
-#   OLD_STACK_DIR       default /opt/nexus-stack
 #   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
 #   NGINX_IMAGE         nginx image for apt-nginx and content-cache, tag@digest
 #   APT_CACHE_MAX_SIZE  apt package cache ceiling, default 40g
@@ -55,7 +39,6 @@
 set -euo pipefail
 
 STACK_DIR="${STACK_DIR:-/opt/mirror-stack}"
-OLD_STACK_DIR="${OLD_STACK_DIR:-/opt/nexus-stack}"
 DRY_RUN="${DRY_RUN:-0}"
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-50m}"
 LOG_MAX_FILES="${LOG_MAX_FILES:-5}"
@@ -97,9 +80,8 @@ if [[ "${DRY_RUN}" != "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# The repository tables. These are the 44 proxies from install.sh, regrouped by
-# what actually serves them. Every name here is a URL clients already use, so a
-# name is not free to change.
+# The repository tables, grouped by what serves them. Every name here is a URL
+# clients already use, so a name is not free to change.
 # ---------------------------------------------------------------------------
 
 # name:subdomain:hostport:upstream -- each gets a REGISTRY_IMAGE container in
@@ -187,8 +169,8 @@ HELM_REPOS=(
   "helm-containeroo:charts.containeroo.ch:"
 )
 
-# Raw HTTP proxies. Nexus ran these with contentMaxAge=0; nginx matches that by
-# checking upstream on every request and serving its cached copy if that fails.
+# Raw HTTP proxies. nginx checks upstream on every request and serves its
+# cached copy if that fails.
 RAW_REPOS=(
   "raw-k8s:dl.k8s.io:"
   "raw-helm:get.helm.sh:"
@@ -201,9 +183,9 @@ RAW_REPOS=(
 # external-prefix|local-route -- where a Helm index.yaml points, and where it
 # should point instead.
 #
-# A chart index carries absolute download URLs. Nexus rewrote them to itself;
-# Caddy cannot rewrite a response body at all, so until now `helm install`
-# fetched the index from the mirror and the chart from GitHub. nginx does the
+# A chart index carries absolute download URLs. Caddy cannot rewrite a
+# response body at all, so `helm install` would fetch the index from the mirror
+# and the chart from GitHub. nginx does the
 # rewrite, and the route it rewrites to has to be one that can serve the thing --
 # which is why following redirects server-side is part of the same job rather
 # than a separate nicety.
@@ -233,30 +215,22 @@ CHART_URL_REWRITES=(
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-CERT_SRC=""
 if [[ "${DRY_RUN}" != "1" && -n "${GLOBAL_BASE_DOMAIN}" ]]; then
-  log "Preflight: the wildcard must exist to be carried across"
-  # First run takes it from the Nexus stack. Every run after that -- including
-  # after /opt/nexus-stack has been purged -- finds it already in place here.
-  # Checking only the old location would turn a re-run into a hard failure the
-  # moment the old stack is reclaimed, which is exactly when nobody expects it.
-  for d in "${OLD_STACK_DIR}" "${STACK_DIR}"; do
-    if [[ -s "${d}/certs/${GLOBAL_CERT_NAME}.crt" && -s "${d}/certs/${GLOBAL_CERT_NAME}.key" ]]; then
-      CERT_SRC="${d}/certs"; break
-    fi
-  done
-  [[ -n "${CERT_SRC}" ]] || die "no ${GLOBAL_CERT_NAME} wildcard in ${OLD_STACK_DIR}/certs or ${STACK_DIR}/certs.
+  log "Preflight: the wildcard must already be in place"
+  cert_dir="${STACK_DIR}/certs"
+  [[ -s "${cert_dir}/${GLOBAL_CERT_NAME}.crt" && -s "${cert_dir}/${GLOBAL_CERT_NAME}.key" ]] \
+    || die "no ${GLOBAL_CERT_NAME} wildcard in ${cert_dir}.
 Caddy cannot reissue it -- the name geo-resolves to a different mirror on each
 lookup, so HTTP-01 can never complete. Run the \"Renew wildcard cert\" workflow
 first, then retry. Nothing has been changed."
-  echo "    wildcard found in ${CERT_SRC}, expires: $(openssl x509 -noout -enddate \
-    -in "${CERT_SRC}/${GLOBAL_CERT_NAME}.crt" | cut -d= -f2)"
+  echo "    wildcard found in ${cert_dir}, expires: $(openssl x509 -noout -enddate \
+    -in "${cert_dir}/${GLOBAL_CERT_NAME}.crt" | cut -d= -f2)"
 fi
 
 # A host with no room left fails deep inside an image pull or a cache write,
 # with an error that reads like anything but a full disk. Check first and say so.
-# This runs before anything is written and long before Nexus is stopped, and it
-# matters more now that a registry cache only grows.
+# This runs before anything is written, and it matters more now that a registry
+# cache only grows.
 if [[ "${DRY_RUN}" != "1" ]]; then
   need_mb=2048
   for path in "$(dirname "${STACK_DIR}")" /var/lib/docker; do
@@ -272,9 +246,6 @@ grows. Nothing has been changed and the current stack is still serving.
 To reclaim space:
   docker system prune -af                 # unused images and layers
   du -sh /opt/* /var/lib/docker/* 2>/dev/null | sort -h | tail
-On a host already migrated, the stopped Nexus stack is usually the largest
-thing on disk and is safe to remove once the new stack has proven itself:
-  rm -rf /opt/nexus ${OLD_STACK_DIR}
 On a host that ran apt-cacher-ng, its old cache is left in place too, and is
 safe to remove once apt-nginx is serving:
   rm -rf ${STACK_DIR}/apt-cache ${STACK_DIR}/apt-log"
@@ -296,24 +267,12 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   # at once. Remove it.
   rm -f "${STACK_DIR}"/registries/*/scheduler-state.json
 
-  if [[ -n "${CERT_SRC}" && "${CERT_SRC}" != "${STACK_DIR}/certs" ]]; then
-    log "Carrying TLS state across from ${OLD_STACK_DIR}"
-    cp -a "${CERT_SRC}/." "${STACK_DIR}/certs/"
-  else
-    log "Wildcard already in place"
-  fi
   if compgen -G "${STACK_DIR}/certs/*.crt" >/dev/null; then
     chmod 644 "${STACK_DIR}"/certs/*.crt
     chmod 600 "${STACK_DIR}"/certs/*.key
   fi
-  # Same reasoning as the wildcard: on a re-run this is already here, and saying
-  # "the regional certs will be reissued" at a host that holds them would be
-  # both wrong and alarming.
   if [[ -n "$(ls -A "${STACK_DIR}/caddy-data" 2>/dev/null)" ]]; then
     echo "    ACME account and regional certs already in place; nothing will be reissued"
-  elif [[ -d "${OLD_STACK_DIR}/caddy-data" ]]; then
-    cp -a "${OLD_STACK_DIR}/caddy-data/." "${STACK_DIR}/caddy-data/"
-    echo "    ACME account and regional certs carried across; nothing will be reissued"
   else
     echo "    WARNING: no caddy-data found; the 8 regional names will be reissued"
   fi
@@ -781,8 +740,7 @@ log "Writing nginx.conf"
 } > "${STACK_DIR}/nginx.conf"
 
 # ---------------------------------------------------------------------------
-# Landing page. The Nexus UI is gone and nothing replaces it, so the bare
-# hostname serves what is actually useful: the repository list, and a /healthz
+# Landing page. The bare hostname serves the repository list, and a /healthz
 # for the deploy workflow to assert on.
 # ---------------------------------------------------------------------------
 log "Writing landing page"
@@ -853,7 +811,7 @@ official_rewrite() {
 
 # Caddy adds X-Forwarded-For / -Proto / -Host to every proxied request. That is
 # right for a backend you own and wrong for a third-party origin: these are
-# public CDNs being fetched as an ordinary client, which is what Nexus did.
+# public CDNs being fetched as an ordinary client.
 # packages.buildkite.com is the proof -- it answers a request carrying
 # X-Forwarded-Host with a 301 to its marketing site instead of the signed CDN
 # URL for the key. Strip them here: content-cache forwards client headers
@@ -1144,7 +1102,7 @@ compose_logging() {
 } > "${STACK_DIR}/docker-compose.yml"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-  log "DRY_RUN=1: files written to ${STACK_DIR}, nothing started, Nexus untouched"
+  log "DRY_RUN=1: files written to ${STACK_DIR}, nothing started"
   exit 0
 fi
 
@@ -1154,16 +1112,13 @@ fi
 # compose resolves the project from the working directory.
 cd "${STACK_DIR}"
 
-# Pull before stopping anything: a failed pull with Nexus already down is an
-# outage for no reason.
-#
-# `docker compose up` fetches what it does not have, which is after the teardown
-# -- so an unreachable registry, an expired credential or a withdrawn tag became
-# an outage rather than a refusal. One deploy has already hit this: a stale
-# ghcr.io credential on the host turned a public image into "error from
-# registry: denied", and the only reason the mirror stayed up is that compose
-# happened to fail before it replaced the running containers. That is luck, not
-# design.
+# Pull before recreating anything: `docker compose up` fetches what it does not
+# have after the teardown -- so an unreachable registry, an expired credential or
+# a withdrawn tag became an outage rather than a refusal. One deploy has already
+# hit this: a stale ghcr.io credential on the host turned a public image into
+# "error from registry: denied", and the only reason the mirror stayed up is
+# that compose happened to fail before it replaced the running containers. That
+# is luck, not design.
 log "Pulling images (current stack still serving)"
 docker compose pull --quiet || die "could not pull one or more images; nothing has been stopped and the current stack is still serving.
 
@@ -1184,14 +1139,6 @@ docker run --rm --network none -v "${STACK_DIR}/apt-nginx.conf:/etc/nginx/nginx.
   || die "apt-nginx.conf is invalid; nothing has been stopped or restarted"
 docker run --rm --network none --entrypoint nginx -v "${STACK_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro" "${NGINX_IMAGE}" -t -q \
   || die "nginx.conf is invalid; nothing has been stopped or restarted"
-
-if [[ -f "${OLD_STACK_DIR}/docker-compose.yml" ]]; then
-  log "Stopping Nexus"
-  ( cd "${OLD_STACK_DIR}" && docker compose down --remove-orphans ) || \
-    die "could not stop the Nexus stack; the new stack has NOT been started and port 80/443 are still Nexus's"
-else
-  log "No Nexus stack at ${OLD_STACK_DIR}; nothing to stop"
-fi
 
 log "Starting the mirror stack"
 cd "${STACK_DIR}"
@@ -1350,22 +1297,13 @@ if [[ "${failed}" -ne 0 ]]; then
   cat >&2 <<EOF
 ${failed} check(s) failed.
 
-Read this before rolling back. These are assertions about a stack that is
+Read this before changing anything. These are assertions about a stack that is
 already running, and an assertion can be wrong -- a check that fails while the
 rest of the table passes is far more likely to be a bad expectation than a
 broken mirror. Confirm the thing the check claims is broken really is:
 
   curl -sI --resolve ${BASE_DOMAIN}:443:127.0.0.1 https://${BASE_DOMAIN}/healthz
   cd ${STACK_DIR} && docker compose ps && docker compose logs --tail 50
-
-Roll back only if the mirror is genuinely not serving. Nexus is stopped but
-intact:
-
-  cd ${STACK_DIR} && docker compose down
-  cd ${OLD_STACK_DIR} && docker compose up -d
-
-Nothing under /opt/nexus or ${OLD_STACK_DIR} was deleted, and the wildcard is in
-both stacks' certs/ directories.
 EOF
   exit 1
 fi
@@ -1376,25 +1314,7 @@ Done on ${BASE_DOMAIN}.
 
   ${#APT_REPOS[@]} apt repositories via apt-nginx, 7 registry containers (${REGISTRY_IMAGE%@*}),
   ${#HELM_REPOS[@]} helm + ${#RAW_REPOS[@]} raw via nginx.
-  No licence meter, no admin user, no EULA, no realm.
 
-EOF
-
-if [[ -d "${OLD_STACK_DIR}" ]]; then
-  cat <<EOF
-Nexus is STOPPED, NOT DELETED. Roll back at any time with:
-
-  cd ${STACK_DIR} && docker compose down
-  cd ${OLD_STACK_DIR} && docker compose up -d
-
-Once you are satisfied -- give it a few days of real traffic -- reclaim the disk:
-
-  rm -rf /opt/nexus ${OLD_STACK_DIR}
-
-EOF
-fi
-
-cat <<EOF
 The caches start cold. That is expected and self-correcting; the first pull of
 anything is a miss; after that raw paths revalidate and fall back to the cache.
 EOF

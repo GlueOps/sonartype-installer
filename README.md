@@ -334,9 +334,11 @@ surfaces as an auth error.
 
 ## Prerequisites
 
-- Linux with Docker and the Compose plugin, and root.
+- Linux with Docker and the Compose plugin, `curl`, and root; `openssl` too
+  when `GLOBAL_BASE_DOMAIN` is set.
 - DNS records pointing every registry hostname above — plus `BASE_DOMAIN`
-  itself — at the host, **before** you run it. Caddy fails its ACME challenge
+  itself — at the host, **before** you run it. With `GLOBAL_BASE_DOMAIN`, the
+  same names under it need records too, on the latency/geo record. Caddy fails its ACME challenge
   for any name that does not yet resolve, and one failing site block is enough
   to keep Caddy from starting.
 - Ports 80 and 443 reachable from the internet, for HTTP-01.

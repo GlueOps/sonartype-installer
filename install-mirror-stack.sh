@@ -33,6 +33,7 @@
 #   NGINX_IMAGE         nginx image for apt-nginx and content-cache, tag@digest
 #   APT_CACHE_MAX_SIZE  apt package cache ceiling, default 40g
 #   APT_CACHE_MIN_FREE  free disk the apt cache always leaves, default 10g
+#   NGINX_CACHE_MAX_SIZE helm and raw cache ceiling, default 20g
 #   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
 #   LOG_MAX_FILES       rotated log files kept per container, default 5
 #   DRY_RUN=1           generate the config files and stop
@@ -1107,7 +1108,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Cutover
+# Pull, check, start
 # ---------------------------------------------------------------------------
 # compose resolves the project from the working directory.
 cd "${STACK_DIR}"

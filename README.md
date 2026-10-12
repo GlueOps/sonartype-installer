@@ -288,7 +288,7 @@ docker pull gcr.<BASE_DOMAIN>/kaniko-project/executor:latest
 | `gcr.io` | `gcr.<BASE_DOMAIN>` |
 
 Everything else is path-addressable, shares the one hostname `<BASE_DOMAIN>`,
-and is reached at `https://<BASE_DOMAIN>/repository/<name>/`:
+and is reached at `https://<BASE_DOMAIN>/repository/<name>`:
 
 | Kind | Repos | Upstream |
 | --- | --- | --- |
@@ -309,8 +309,12 @@ and is reached at `https://<BASE_DOMAIN>/repository/<name>/`:
 | Raw | `raw-buildkite-helm` | `packages.buildkite.com/helm-linux/helm-debian` |
 | Raw | `raw-github` | `github.com` |
 
-Each APT suite is its own repository. `resolute` is Ubuntu 26.04 LTS; the
-codename, not the number, is what an APT suite is addressed by.
+Each APT suite is its own repository.
+
+`resolute` is Ubuntu 26.04 LTS. The codename, not the number, is what an APT
+suite is addressed by, and it is also what `ansible_distribution_release` and
+friends hand you — so a mirror that tracks the number is a mirror that will be
+edited again in two years.
 
 Signing keys come through the raw repositories, which is also why `raw-docker`
 proxies the host root: one repository covers both of Docker's trees.
@@ -321,6 +325,10 @@ https://<BASE_DOMAIN>/repository/raw-docker/linux/ubuntu/gpg
 https://<BASE_DOMAIN>/repository/raw-buildkite-helm/gpgkey
 ```
 
+`raw-github` is for release assets. A GitHub release download answers `302` to
+GitHub's asset CDN; nginx follows it, so the host needs egress to that CDN as
+well as to `github.com`.
+
 ### The two Google registries are not interchangeable
 
 `gcr.io` and `us-docker.pkg.dev` are separate namespaces — neither serves the
@@ -328,25 +336,27 @@ other's paths and there is no redirect between them. Artifact Registry paths are
 `<project>/<repo>/<image>` (three segments); `gcr.io` paths are
 `<project>/<image>` (two). Pick the mirror matching the host you started with.
 
+Mirroring `europe-docker.pkg.dev` or `asia-docker.pkg.dev` buys nothing: an
+Artifact Registry hostname identifies where a repository *lives*, not a replica
+to pull it from, so the same image is not served from all three.
+
 Misses from either Google registry return `401`, not `404` — Artifact Registry
 does not disclose whether a private or nonexistent repo exists. A typo'd path
 surfaces as an auth error.
 
 ## Prerequisites
 
-- Linux with Docker and the Compose plugin, `curl`, and root; `openssl` too
-  when `GLOBAL_BASE_DOMAIN` is set.
-- DNS records pointing every registry hostname above — plus `BASE_DOMAIN`
-  itself — at the host, **before** you run it. With `GLOBAL_BASE_DOMAIN`, the
-  same names under it need records too, on the latency/geo record. Caddy fails its ACME challenge
-  for any name that does not yet resolve, and one failing site block is enough
-  to keep Caddy from starting.
+- Linux with Docker and the Compose plugin, `curl`, and root.
+- DNS `A`/`AAAA` records pointing every registry hostname above — plus
+  `BASE_DOMAIN` itself — at the host, **before** you run it. Caddy fails its
+  ACME challenge for any name that does not yet resolve, and one failing site
+  block is enough to keep Caddy from starting.
 - Ports 80 and 443 reachable from the internet, for HTTP-01.
 
 ## Configuration
 
 Everything is environment variables. `BASE_DOMAIN` and `ACME_EMAIL` are
-required; the full list, with defaults, is in the header of
+required; the optional ones are described in the header of
 `install-mirror-stack.sh`.
 
 ### A second, global hostname

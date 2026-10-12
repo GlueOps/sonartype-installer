@@ -1,19 +1,9 @@
 # sonartype-installer
 
-> **Nexus Repository Community Edition enforces usage limits from 15 October
-> 2026** — 40,000 components *or* 100,000 requests per day, and exceeding either
-> one blocks *adding new components* until you are back under **both**. For a
-> deployment that is entirely proxy repositories, **a cache miss is a component
-> addition**, so going over the request cap does not throttle the mirror: it
-> stops it caching anything it has not already cached.
->
-> **[`install-mirror-stack.sh`](#install-mirror-stacksh) builds the same mirror
-> without Nexus**, and migrates a host that already runs one. `install.sh` below
-> is unchanged and still supported for deployments that stay under the limits.
-
 One shell script that turns a bare Linux host into a caching pull-through mirror
 for the public container registries, APT suites and Helm charts a Kubernetes
-cluster pulls from — Sonatype Nexus behind Caddy, with TLS, on a domain you own.
+cluster pulls from — nginx, `ghcr.io/glueops/registry` and Caddy, with TLS, on a
+domain you own.
 
 It is idempotent: re-running it against a live host reconciles configuration
 rather than rebuilding, so it doubles as the upgrade path.
@@ -21,31 +11,20 @@ rather than rebuilding, so it doubles as the upgrade path.
 ```bash
 sudo BASE_DOMAIN=repo.example.com \
      ACME_EMAIL=admin@example.com \
-     NEXUS_NEW_ADMIN_PASSWORD='<a password you generated>' \
-     bash install.sh
-```
-
-## `install-mirror-stack.sh`
-
-The same mirror, decomposed by protocol, with no licence meter.
-
-```bash
-sudo BASE_DOMAIN=repo.example.com \
-     ACME_EMAIL=admin@example.com \
      bash install-mirror-stack.sh
 ```
 
-| Was, under Nexus | Is |
-| --- | --- |
-| 27 apt proxy repositories | nginx (`apt-nginx`), 7 upstream hosts (below) |
-| 7 docker proxy repositories | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
-| 4 helm + 6 raw proxy repositories | nginx cache behind Caddy |
-| Nexus UI | a static index of what the host serves, plus `/healthz` |
+## How it works
 
-No admin user, no EULA, and no *Docker Bearer Token Realm* to switch on by hand
-after every rebuild. Client URLs are unchanged: `/repository/<name>/` is a Nexus
-path convention, but the generated nginx and Caddy routes reproduce it verbatim,
-so no `sources.list` or `helm repo add` in your estate has to move.
+| What | Served by |
+| --- | --- |
+| 27 apt repositories | nginx (`apt-nginx`), 7 upstream hosts (below) |
+| 7 container registries | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
+| 4 helm + 6 raw repositories | nginx cache behind Caddy |
+| `https://<BASE_DOMAIN>/` | a static index of what the host serves, plus `/healthz` |
+
+Every path-addressed repository lives at `/repository/<name>/`. Those URLs are
+what clients already use, so a name is not free to change.
 
 Every cache is plain local disk. Upstream is explicit that a pull-through
 registry cache uses the `filesystem` storage driver; apt, helm and raw cache in
@@ -86,14 +65,7 @@ cat /root/.docker/config.json     # an auths entry for the registry
 docker logout <registry>
 ```
 
-### Migrating from Nexus
-
-If a stack built by `install.sh` is present, it is **stopped, not deleted**, and
-its TLS material is carried across first. Rollback is a compose up in the old
-stack directory. On a host with no Nexus, that phase is skipped entirely.
-
-Images are pulled *before* anything is stopped, so a failed pull is not an
-outage. `DRY_RUN=1` writes the compose file, Caddyfile, `nginx.conf` and
+`DRY_RUN=1` writes the compose file, Caddyfile, `nginx.conf` and
 `apt-nginx.conf` and stops.
 
 ### Upgrading a host that ran apt-cacher-ng
@@ -121,8 +93,7 @@ regional names a certificate that does not match. The generated Caddyfile keeps
 them apart: regional on ACME, global on the pre-issued wildcard.
 
 **`X-Forwarded-*` is stripped from apt, helm and raw upstream requests.** Those
-are third-party CDNs being fetched as an ordinary client, which is what Nexus
-did. `packages.buildkite.com` is the proof: it answers a request carrying
+are third-party CDNs being fetched as an ordinary client. `packages.buildkite.com` is the proof: it answers a request carrying
 `X-Forwarded-Host` with a 301 to its marketing site instead of the signed URL
 for the signing key. The registry routes keep their headers; those backends are
 yours.
@@ -245,10 +216,9 @@ unreachable, and rewrite a response body.
 
 **Chart URLs are rewritten.** A Helm `index.yaml` carries absolute download
 URLs — 219 pointing at `github.com` across tigera, metrics-server and
-containeroo, and 11,652 at `charts.helm.sh` in the archived helm-stable. Nexus
-rewrote them to itself; Caddy could not, so `helm install` fetched the index
-from the mirror and the chart from GitHub. nginx rewrites them with
-`sub_filter`.
+containeroo, and 11,652 at `charts.helm.sh` in the archived helm-stable. Caddy
+cannot rewrite them, so `helm install` would fetch the index from the mirror and
+the chart from GitHub. nginx rewrites them with `sub_filter`.
 
 Note `proxy_set_header Accept-Encoding "";` on those locations. Every one of
 those indexes serves gzip when asked, and **`sub_filter` cannot touch a
@@ -268,8 +238,7 @@ http_5xx` is the point of the whole component. Verified: with an entry's TTL
 expired and the upstream resolving to an unroutable address, a cached path
 returns 200 from disk while a path that was never cached returns 504.
 
-**Raw revalidates on every request**, as `contentMaxAge: 0` did under Nexus:
-`proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
+**Raw revalidates on every request**: `proxy_cache_valid 1s`, upstream cache headers ignored, and the cached copy
 served on error, timeout, 5xx, 429, 403 and 404. A refused connection falls
 back immediately, an unreachable upstream after 5s per address with no new
 attempt after 10s, and a hanging one after 30s (read timeout). The 10s only
@@ -296,32 +265,30 @@ carries a signed URL long enough that the default 4k buffer fails the request as
 disabling that silently stops anything larger than the buffers from ever being
 cached.
 
-## `install.sh` (Nexus)
+## Using the mirror
 
-### What it builds
+Every registry gets its own hostname, because the Docker registry protocol has
+no way to select a backend from the path — the hostname is the only routing
+signal a `docker pull` sends. Swap the upstream host for the mirror host and
+keep the rest of the reference:
 
-| Component | Where |
+```
+docker pull gcr.io/kaniko-project/executor:latest
+docker pull gcr.<BASE_DOMAIN>/kaniko-project/executor:latest
+```
+
+| Upstream registry | Mirror hostname |
 | --- | --- |
-| Nexus 3 | container `nexus`, data in `/opt/nexus/nexus-data`, bound to `127.0.0.1` only |
-| Caddy | container `nexus-caddy`, the only thing on `:80`/`:443` |
-| Compose + Caddyfile | generated into `/opt/nexus-stack` |
+| `docker.io` | `dockerhub.<BASE_DOMAIN>` |
+| `ghcr.io` | `ghcr.<BASE_DOMAIN>` |
+| `quay.io` | `quay.<BASE_DOMAIN>` |
+| `public.ecr.aws` | `ecr.<BASE_DOMAIN>` |
+| `registry.k8s.io` | `k8s.<BASE_DOMAIN>` |
+| `us-docker.pkg.dev` | `gcp.<BASE_DOMAIN>` |
+| `gcr.io` | `gcr.<BASE_DOMAIN>` |
 
-Every registry gets its own hostname and its own Nexus Docker port, because the
-Docker registry protocol has no way to select a backend from the path — the
-hostname is the only routing signal a `docker pull` sends.
-
-| Upstream registry | Mirror hostname | Nexus repo | Port |
-| --- | --- | --- | --- |
-| `docker.io` | `dockerhub.<BASE_DOMAIN>` | `dockerhub` | 5000 |
-| `ghcr.io` | `ghcr.<BASE_DOMAIN>` | `ghcr` | 5001 |
-| `quay.io` | `quay.<BASE_DOMAIN>` | `quay` | 5002 |
-| `public.ecr.aws` | `ecr.<BASE_DOMAIN>` | `public-ecr` | 5003 |
-| `registry.k8s.io` | `k8s.<BASE_DOMAIN>` | `registry-k8s-io` | 5004 |
-| `us-docker.pkg.dev` | `gcp.<BASE_DOMAIN>` | `us-docker-pkg-dev` | 5005 |
-| `gcr.io` | `gcr.<BASE_DOMAIN>` | `gcr-io` | 5006 |
-
-Everything else is path-addressable, so it shares the one hostname
-`<BASE_DOMAIN>` and is reached at `https://<BASE_DOMAIN>/repository/<name>`.
+Everything else is path-addressable, shares the one hostname `<BASE_DOMAIN>`,
+and is reached at `https://<BASE_DOMAIN>/repository/<name>`:
 
 | Kind | Repos | Upstream |
 | --- | --- | --- |
@@ -334,7 +301,7 @@ Everything else is path-addressable, so it shares the one hostname
 | Helm | `helm-tigera` | `docs.tigera.io/calico/charts` |
 | Helm | `helm-metrics-server` | `kubernetes-sigs.github.io/metrics-server` |
 | Helm | `helm-containeroo` | `charts.containeroo.ch` |
-| Helm | `helm-stable` | `charts.helm.sh/stable` (archived upstream, see below) |
+| Helm | `helm-stable` | `charts.helm.sh/stable` (archived upstream) |
 | Raw | `raw-k8s` | `dl.k8s.io` |
 | Raw | `raw-helm` | `get.helm.sh` |
 | Raw | `raw-pkgs-k8s` | `pkgs.k8s.io` |
@@ -342,29 +309,15 @@ Everything else is path-addressable, so it shares the one hostname
 | Raw | `raw-buildkite-helm` | `packages.buildkite.com/helm-linux/helm-debian` |
 | Raw | `raw-github` | `github.com` |
 
-A Nexus APT proxy pins one distribution, which is why each suite is its own
-repository rather than a component of a shared one.
+Each APT suite is its own repository.
 
 `resolute` is Ubuntu 26.04 LTS. The codename, not the number, is what an APT
 suite is addressed by, and it is also what `ansible_distribution_release` and
 friends hand you — so a mirror that tracks the number is a mirror that will be
 edited again in two years.
 
-`helm-stable` fronts the Helm chart repository archived in 2020. It is kept
-because this script never deletes: dropping the line would leave the repository
-in place on every host that already ran an older version, with nothing in the
-script left to describe it.
-
-### Why signing keys need their own raw proxies
-
-A node cannot add a suite until it has the key that signs it, and an APT proxy
-will not serve that key. Nexus recognises `Release`, `InRelease`, `Release.gpg`,
-`Packages` and `pool/`, and refuses to fetch anything else from upstream — so
-`pkgs.k8s.io`'s `Release.key`, which sits directly beside the suite, is a 404
-through `kubernetes-v1-34` and has to come through `raw-pkgs-k8s` instead.
-
-That is also why `raw-docker` proxies the host root rather than a key path: one
-repository then covers both of Docker's trees.
+Signing keys come through the raw repositories, which is also why `raw-docker`
+proxies the host root: one repository covers both of Docker's trees.
 
 ```
 https://<BASE_DOMAIN>/repository/raw-pkgs-k8s/core:/stable:/v1.34/deb/Release.key
@@ -373,71 +326,8 @@ https://<BASE_DOMAIN>/repository/raw-buildkite-helm/gpgkey
 ```
 
 `raw-github` is for release assets. A GitHub release download answers `302` to
-`objects.githubusercontent.com`; Nexus follows it, so the host needs egress to
-that CDN name as well as to `github.com`.
-
-### Why the raw proxies revalidate and the others do not
-
-Every `raw-*` repository sets `contentMaxAge: 0`; apt and Helm keep `-1`.
-
-The split is about whether a path is version-addressed. A `.deb` or a `.tgz`
-names its version, so the bytes at that path never legitimately change and
-caching them forever is correct — a TTL there would buy nothing but revalidation
-traffic. Raw has no such guarantee, and no metadata class either: Nexus cannot
-tell a pinned tarball from a mutable pointer, so *everything* in a raw
-repository is content and `-1` freezes all of it permanently.
-
-Two of these proxies front pointers that genuinely move:
-
-```
-dl.k8s.io/release/stable.txt     -> v1.37.0
-get.helm.sh/helm-latest-version  -> v4.3.0
-```
-
-And the signing keys are worse than stale, because the metadata they are checked
-against *does* refresh — `metadataMaxAge` is 1440 either way. A permanently
-cached key plus a fresh `Release` means the mirror serves a signature its own
-clients cannot verify, and an apt source pinned with `signed-by=` fails hard
-rather than falling back.
-
-`contentMaxAge: 0` does not mean "always fetch". Nexus issues a conditional
-request and serves the cache on a `304` — every upstream here supports that,
-including `pkgs.k8s.io` via its CDN redirect. It also serves the cache when
-revalidation fails outright, so an unreachable or erroring upstream degrades to
-the cached copy rather than to an error.
-
-`install-mirror-stack.sh` reproduces this in nginx; see *Raw revalidates on
-every request* above.
-
-### Changing a repository that already exists
-
-`create_if_missing` matches on name and nothing else. It will not reconcile a
-repository it finds, which is deliberate — it is what lets you tune a proxy in
-the UI without this script reverting you on the next run. The cost is that a
-settings change here does not reach a mirror that already ran an older version.
-
-To push one, `PUT` the full body; Nexus replaces rather than merges:
-
-```bash
-curl -u "admin:${NEXUS_NEW_ADMIN_PASSWORD}" -X PUT \
-  -H 'Content-Type: application/json' \
-  "https://${BASE_DOMAIN}/service/rest/v1/repositories/raw/proxy/raw-k8s" \
-  -d @- <<'JSON'
-{ ... the payload from install.sh, with contentMaxAge 0 ... }
-JSON
-```
-
-Only repositories whose definition changed need this. On a mirror built before
-the raw proxies revalidated, that is `raw-k8s` and `raw-helm`; the other four
-are new and get the right value from the create.
-
-To use a mirror, swap the upstream host for the mirror host and keep the rest of
-the reference:
-
-```
-docker pull gcr.io/kaniko-project/executor:latest
-docker pull gcr.<BASE_DOMAIN>/kaniko-project/executor:latest
-```
+GitHub's asset CDN; nginx follows it, so the host needs egress to that CDN as
+well as to `github.com`.
 
 ### The two Google registries are not interchangeable
 
@@ -456,53 +346,18 @@ surfaces as an auth error.
 
 ## Prerequisites
 
-- Linux with Docker and the Compose plugin. The script reads `/proc/meminfo` to
-  size the JVM heap at 80% of system RAM, so it is Linux-only.
-- `curl`, `python3`, and root.
-- DNS `A`/`AAAA` records pointing every hostname in the table above — plus
+- Linux with Docker and the Compose plugin, `curl`, and root.
+- DNS `A`/`AAAA` records pointing every registry hostname above — plus
   `BASE_DOMAIN` itself — at the host, **before** you run it. Caddy fails its
-  ACME challenge for any name that does not yet resolve.
-- Ports 80 and 443 reachable from the internet (for HTTP-01), or Route53
-  credentials and `ENABLE_DNS_CHALLENGE=true` (for DNS-01).
+  ACME challenge for any name that does not yet resolve, and one failing site
+  block is enough to keep Caddy from starting.
+- Ports 80 and 443 reachable from the internet, for HTTP-01.
 
 ## Configuration
 
-Everything is environment variables. Required:
-
-| Variable | Meaning |
-| --- | --- |
-| `BASE_DOMAIN` | Hostname of this mirror, e.g. `repo.example.com`. All registry hostnames are derived from it. |
-| `ACME_EMAIL` | Contact address for the ACME account. |
-| `NEXUS_NEW_ADMIN_PASSWORD` | Password the `admin` user is set to. On a re-run this is also how the script authenticates. |
-
-Optional:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `NEXUS_IMAGE` | `sonatype/nexus3:3.94.1` | Nexus image and tag. |
-| `STACK_DIR` | `/opt/nexus-stack` | Where the compose file, Caddyfile and certs live. |
-| `NEXUS_DATA_DIR` | `/opt/nexus/nexus-data` | Nexus data volume on the host. |
-| `ENABLE_ANON` | `true` | Enable anonymous access, so clients pull without credentials. |
-| `ENABLE_DNS_CHALLENGE` | `false` | Use Route53 DNS-01 instead of HTTP-01. Builds a Caddy image with the `route53` DNS module. |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | — | Route53 credentials, required when `ENABLE_DNS_CHALLENGE=true`. Also accepted without the `AWS_` prefix. |
-| `AWS_REGION` | `us-east-1` | Route53 is global, but the SDK wants a region. |
-| `P_DOCKERHUB` … `P_GCR` | `5000`–`5006` | Per-registry Nexus ports. |
-| `PREWARM` / `PREWARM_IMAGES_FILE` | `false` | Pull manifests for a newline-separated list of images so the first real pull is warm. |
-
-### S3 blob store
-
-Set all four and the script creates a blob store named `s3` and points every
-repository at it instead of `default`:
-
-| Variable | Default |
-| --- | --- |
-| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | — (all four required) |
-| `S3_PREFIX` | `nexus/` |
-| `S3_REGION` | `us-east-1` |
-| `S3_FORCE_PATH_STYLE` | `true` |
-
-The script writes `nexus.blobstore.s3.ownership.check.disabled=true` to
-`nexus.properties` so non-AWS S3-compatible endpoints work.
+Everything is environment variables. `BASE_DOMAIN` and `ACME_EMAIL` are
+required; the optional ones are described in the header of
+`install-mirror-stack.sh`.
 
 ### A second, global hostname
 
@@ -514,50 +369,15 @@ names.
 Caddy will not obtain the global cert: a name that resolves to a different
 server on each lookup cannot complete HTTP-01. Issue one wildcard covering
 `<GLOBAL_BASE_DOMAIN>` and `*.<GLOBAL_BASE_DOMAIN>` somewhere central — DNS-01,
-once — and copy the pair to every host:
+once — and copy the pair to every host before running the script, which refuses
+to start without it:
 
 ```
 ${STACK_DIR}/certs/<GLOBAL_CERT_NAME>.crt
 ${STACK_DIR}/certs/<GLOBAL_CERT_NAME>.key
 ```
 
-`GLOBAL_CERT_NAME` defaults to `GLOBAL_BASE_DOMAIN`. The global site blocks fail
-to serve until those files exist; the regional ones are unaffected, so a host
-missing its cert still works on its regional name.
-
-## After the first install
-
-Two steps the REST API cannot do:
-
-1. **Settings → Security → Realms**: move *Docker Bearer Token Realm* to Active.
-   Docker clients and anonymous pulls do not work until you do.
-2. Log in as `admin` and accept the EULA.
-
-## Re-running and upgrading
-
-Re-run with the same variables. The script authenticates with
-`NEXUS_NEW_ADMIN_PASSWORD`, falls back to the generated `admin.password` on a
-fresh install, skips repositories that already exist, and rewrites the compose
-file and Caddyfile. Bumping `NEXUS_IMAGE` and re-running is the upgrade path.
-
-It does not delete or reconcile repositories you have changed by hand — an
-existing repository is left exactly as it is.
-
-## Adding a mirror
-
-A **Docker** registry touches seven places in `install.sh`. `grep -n P_GCR
-install.sh` to see all of them at once: the port default, the regional and
-global derived hostnames, the compose `ports`/`expose` lists, the two Caddy site
-blocks, the `create_if_missing` proxy repository, the prewarm `case` arm, and
-the two summary tables.
-
-An APT, Helm or raw proxy touches one: a single `create_if_missing` line. It
-needs no port, no hostname and no Caddy block, because only the Docker registry
-protocol routes on the hostname — everything else is addressed by path under
-`<BASE_DOMAIN>`, which already has a certificate.
-
-DNS comes first — Caddy fails the ACME challenge for a name that does not
-resolve, and one failing site block is enough to keep Caddy from starting.
+`GLOBAL_CERT_NAME` defaults to `GLOBAL_BASE_DOMAIN`.
 
 ## License
 

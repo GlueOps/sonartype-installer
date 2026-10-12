@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run shellcheck
-        run: shellcheck --severity=warning install.sh install-mirror-stack.sh
+        run: shellcheck --severity=warning install-mirror-stack.sh
 
   # Generates every config the installer writes, in both site shapes, and checks
   # each one with the tool that will load it.

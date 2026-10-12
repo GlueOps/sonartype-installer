@@ -5,13 +5,9 @@ something that has actually gone wrong, not general advice.
 
 ## What this repository is
 
-Two standalone installers. Neither imports the other; both generate a
-`docker-compose.yml` and a `Caddyfile` into a stack directory and bring it up.
-
-| Script | Builds | Status |
-| --- | --- | --- |
-| `install-mirror-stack.sh` | nginx (apt, helm, raw) + `ghcr.io/glueops/registry` + Caddy | current |
-| `install.sh` | Sonatype Nexus + Caddy | legacy — under a usage meter from 15 Oct 2026 |
+One installer, `install-mirror-stack.sh`. It generates a `docker-compose.yml`,
+a `Caddyfile` and two nginx configs into a stack directory and brings up nginx
+(apt, helm, raw), `ghcr.io/glueops/registry` and Caddy.
 
 There is no build system, no test suite and no dependency manifest. A change is
 a change to one shell script. Keep `install-mirror-stack.sh` self-contained:
@@ -20,12 +16,12 @@ would never reach them.
 
 ## CI will reject you for three things
 
-**`shellcheck --severity=warning`** runs against both scripts. Run it before
+**`shellcheck --severity=warning`** runs against the script. Run it before
 pushing:
 
 ```bash
 docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
-  --severity=warning install.sh install-mirror-stack.sh
+  --severity=warning install-mirror-stack.sh
 ```
 
 **Conventional Commits are validated on every commit message in the PR**, not on
@@ -215,11 +211,9 @@ carries every architecture.
 
 ## Do not change client-facing URLs
 
-`/repository/<name>/` is a Nexus path convention that the generated nginx and
-Caddy routes reproduce deliberately, so an existing estate can point at this installer
-without editing a single `sources.list` or `helm repo add`. Renaming a
-repository breaks every client silently — they get a 404, not an error that
-explains itself.
+`/repository/<name>/` is what every `sources.list` and `helm repo add` in the
+estate already points at. Renaming a repository breaks every client silently —
+they get a 404, not an error that explains itself.
 
 ## Adding a repository
 

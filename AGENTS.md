@@ -209,6 +209,24 @@ fault.
 live on `ports.ubuntu.com/ubuntu-ports`. Debian is unaffected — `deb.debian.org`
 carries every architecture.
 
+**The tofu-cache services run as uid 101 with a read-only root.** Their
+`/cache` bind mounts are `chown 101:101` on every real run (not under
+`DRY_RUN`, which CI runs without root); without it both containers crash-loop.
+Their config is baked into the images, so they stay out of the reload loop and
+need no `mirror.cache-zones` label: a new tag recreates them. The git route's
+`response_header_timeout` (660s) must stay above the image's lock wait plus clone
+limit (330s + 300s), because a cold clone answers only once it is done.
+
+## Decisions
+
+Settled; don't re-raise in review.
+
+- `TOFU_PROVIDERS_IMAGE` / `TOFU_GIT_IMAGE` pin the `v0.0.1` tag without a digest,
+  so this was ready before that release existed. Adding the digest later is optional.
+- No rollback runbook for the tofu-cache services: roll forward.
+- The tofu-cache disk budget (about 41 GB on top of the rest) is accepted; hosts
+  have the space.
+
 ## Do not change client-facing URLs
 
 `/repository/<name>/` is what every `sources.list` and `helm repo add` in the

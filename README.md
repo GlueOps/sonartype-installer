@@ -21,6 +21,7 @@ sudo BASE_DOMAIN=repo.example.com \
 | 27 apt repositories | nginx (`apt-nginx`), 7 upstream hosts (below) |
 | 7 container registries | 7 × [`ghcr.io/glueops/registry`](https://github.com/GlueOps/registry) pull-through (below) |
 | 4 helm + 6 raw repositories | nginx cache behind Caddy |
+| OpenTofu providers and GitHub modules | [`ghcr.io/glueops/tofu-cache`](https://github.com/GlueOps/tofu-cache) (`tofu-providers`, `tofu-git`) |
 | `https://<BASE_DOMAIN>/` | a static index of what the host serves, plus `/healthz` |
 
 Every path-addressed repository lives at `/repository/<name>/`. Those URLs are
@@ -40,6 +41,8 @@ registry cache uses the `filesystem` storage driver; apt, helm and raw cache in
 | nginx (helm index) | `5m` | an index is the thing that moves |
 | nginx (eviction) | `inactive=365d` + `max_size` | LRU, disk pressure only |
 | registries | `REGISTRY_PROXY_TTL=0` | never deleted |
+| tofu-providers | version lists `2m`, download info `1d`, release files up to 10 GB | files unused for 60 days are dropped |
+| tofu-git | refreshed at most every 60s, 10 GB total | LRU, and repos unused for 60 days are dropped |
 
 Retention is not freshness. Raising the *freshness* window on raw would be a
 regression: `dl.k8s.io/release/stable.txt` and friends are stable paths whose
@@ -328,6 +331,47 @@ https://<BASE_DOMAIN>/repository/raw-buildkite-helm/gpgkey
 `raw-github` is for release assets. A GitHub release download answers `302` to
 GitHub's asset CDN; nginx follows it, so the host needs egress to that CDN as
 well as to `github.com`.
+
+### OpenTofu providers and modules
+
+Providers from `registry.opentofu.org` and `registry.terraform.io` are served at
+`/repository/tofu/`, and public GitHub repos (which every registry or `git::`
+module on GitHub resolves to) at `/repository/git/github.com/`. Both are
+public-only: no credentials go upstream, and Caddy drops any `Authorization` a
+client sends. A private module through the mirror fails; turn the mirror off for
+that job. Why it works this way (CLI `host` blocks, not `network_mirror`) is in
+the [tofu-cache README](https://github.com/GlueOps/tofu-cache#readme).
+
+In CI, the [OpenTofu CD action](https://github.com/GlueOps/github-actions-opentofu-continuous-delivery)
+opts in with `TOFU_MIRROR_URL: https://<BASE_DOMAIN>`. On a laptop, add to
+`~/.tofurc` (`~/.terraformrc` for Terraform):
+
+```hcl
+host "registry.opentofu.org" {
+  services = {
+    "providers.v1" = "https://<BASE_DOMAIN>/repository/tofu/registry.opentofu.org/v1/providers/"
+    "modules.v1"   = "https://registry.opentofu.org/v1/modules/"
+  }
+}
+host "registry.terraform.io" {
+  services = {
+    "providers.v1" = "https://<BASE_DOMAIN>/repository/tofu/registry.terraform.io/v1/providers/"
+    "modules.v1"   = "https://registry.terraform.io/v1/modules/"
+  }
+}
+```
+
+and, for modules, scope the git rewrite to tofu so your own HTTPS clones, pulls
+and pushes of GitHub repos (private ones fail through the mirror) are untouched:
+
+```bash
+tofu() {
+  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0='url.https://<BASE_DOMAIN>/repository/git/github.com/.insteadOf' \
+  GIT_CONFIG_VALUE_0='https://github.com/' \
+  command tofu "$@"
+}
+```
 
 ### The two Google registries are not interchangeable
 

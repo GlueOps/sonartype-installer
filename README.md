@@ -41,8 +41,8 @@ registry cache uses the `filesystem` storage driver; apt, helm and raw cache in
 | nginx (helm index) | `5m` | an index is the thing that moves |
 | nginx (eviction) | `inactive=365d` + `max_size` | LRU, disk pressure only |
 | registries | `REGISTRY_PROXY_TTL=0` | never deleted |
-| tofu-providers | version lists `2m`, download info `1d`, release files up to 10 GB | files unused for 60 days are dropped |
-| tofu-git | refreshed at most every 60s, 10 GB total | LRU, and repos unused for 60 days are dropped |
+| tofu-providers | version lists `2m`, download info `1d`, release files up to 20 GB | files unused for 60 days are dropped |
+| tofu-git | refreshed at most every 60s, 20 GB total | LRU, and repos unused for 60 days are dropped |
 
 Retention is not freshness. Raising the *freshness* window on raw would be a
 regression: `dl.k8s.io/release/stable.txt` and friends are stable paths whose

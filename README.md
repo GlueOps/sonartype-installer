@@ -344,7 +344,7 @@ the [tofu-cache README](https://github.com/GlueOps/tofu-cache#readme).
 
 In CI, the [OpenTofu CD action](https://github.com/GlueOps/github-actions-opentofu-continuous-delivery)
 opts in with `TOFU_MIRROR_URL: https://<BASE_DOMAIN>`. On a laptop, add to
-`~/.tofurc` (`~/.terraformrc` for Terraform):
+`~/.tofurc`:
 
 ```hcl
 host "registry.opentofu.org" {

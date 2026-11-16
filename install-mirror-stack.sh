@@ -1380,16 +1380,19 @@ done
 check "tofu providers versions" '^200$' "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/versions"
 # The download URL must point back here, or tofu fetches the provider from
 # GitHub directly. Fetched and asserted separately, as for the helm rewrite.
-tofu_dl=""
-for _ in $(seq 1 15); do
-  tofu_dl="$(curl -fsS --max-time 60 \
+# --max-time sits just above the image's own bound for a stalled upstream (~70s),
+# so its 504 is what gets reported rather than curl giving up first.
+for _ in 1 2; do
+  tofu_out="$(curl -s --max-time 75 -w '\n%{http_code}' \
     "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/3.2.4/download/linux/amd64" 2>/dev/null)" \
-    && [[ -n "${tofu_dl}" ]] && break
-  tofu_dl=""
+    || true
+  tofu_code="${tofu_out##*$'\n'}"
+  tofu_dl="${tofu_out%$'\n'*}"
+  [[ "${tofu_code}" == 200 ]] && break
   sleep 2
 done
-if [[ -z "${tofu_dl}" ]]; then
-  printf '  FAIL  %-30s could not fetch the download info\n' "tofu download_url rewrite"
+if [[ "${tofu_code}" != 200 ]]; then
+  printf '  FAIL  %-30s could not fetch the download info (%s)\n' "tofu download_url rewrite" "${tofu_code:-000}"
   failed=$((failed + 1))
 elif grep -qE '"download_url": ?"/repository/tofu/dl/' <<<"${tofu_dl}"; then
   printf '  ok    %-30s download urls point here\n' "tofu download_url rewrite"

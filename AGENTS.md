@@ -226,6 +226,11 @@ Settled; don't re-raise in review.
 - No rollback runbook for the tofu-cache services: roll forward.
 - The tofu-cache disk budget (about 41 GB on top of the rest) is accepted; hosts
   have the space.
+- `/repository/git/` clones any public GitHub repo for anyone, with no allowlist
+  or rate limit, as the pull-through registries already serve any image. Accepted:
+  many large clones at once can hold all 64 git workers (up to ~11 min each) and
+  overshoot the 20 GB cap between 10-minute sweeps, on the disk every cache here
+  shares. Per-client limits are deferred in tofu-cache's own Decisions.
 
 ## Do not change client-facing URLs
 

@@ -10,6 +10,10 @@
 #    7 registries       -> ghcr.io/glueops/registry in pull-through mode, one per
 #                          upstream (see REGISTRY_IMAGE)
 #    4 helm + 6 raw     -> nginx cache behind Caddy
+#    OpenTofu           -> ghcr.io/glueops/tofu-cache: providers from
+#                          registry.opentofu.org/registry.terraform.io, and
+#                          public GitHub repos for modules (/repository/tofu/,
+#                          /repository/git/)
 #
 # Every cache is plain local disk. Upstream is explicit that a pull-through
 # registry cache uses the filesystem storage driver; apt, helm and raw cache in
@@ -31,6 +35,8 @@
 #   STACK_DIR           default /opt/mirror-stack
 #   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
 #   NGINX_IMAGE         nginx image for apt-nginx and content-cache, tag@digest
+#   TOFU_PROVIDERS_IMAGE  OpenTofu provider cache image, tag@digest (default: tofu-cache v0.0.1)
+#   TOFU_GIT_IMAGE        GitHub module cache image, tag@digest (default: tofu-cache v0.0.1)
 #   APT_CACHE_MAX_SIZE  apt package cache ceiling, default 40g
 #   APT_CACHE_MIN_FREE  free disk the apt cache always leaves, default 10g
 #   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
@@ -63,6 +69,11 @@ NGINX_CACHE_MAX_SIZE="${NGINX_CACHE_MAX_SIZE:-20g}"
 # on a blob with 401, and the proxy HEADs every blob before fetching it.
 # https://github.com/GlueOps/registry
 REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/glueops/registry:v0.0.2@sha256:8cb6fbe5b2e5b969c917026d3f323fcdfceb5d7dab2c1960e26bccd852ca0e82}"
+
+# OpenTofu provider and GitHub module caches; their cache limits are baked in.
+# https://github.com/GlueOps/tofu-cache
+TOFU_PROVIDERS_IMAGE="${TOFU_PROVIDERS_IMAGE:-ghcr.io/glueops/tofu-cache-providers:v0.0.1@sha256:9e7512a4977226614af532c6764c9f4e7fa55a72aefcd941b2caa8ffc12994d5}"
+TOFU_GIT_IMAGE="${TOFU_GIT_IMAGE:-ghcr.io/glueops/tofu-cache-git:v0.0.1@sha256:0e6811b48b0eee5f5d90df1717c68ad9fb07634bd3c291c67ac5ac26e8a33c56}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "==> $*"; }
@@ -254,7 +265,7 @@ safe to remove once apt-nginx is serving:
 fi
 
 log "Preparing ${STACK_DIR}"
-mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-nginx-cache,registries,content-cache,content-log}
+mkdir -p "${STACK_DIR}"/{certs,caddy-data,caddy-config,apt-nginx-cache,registries,content-cache,content-log,tofu-providers-cache,tofu-git-cache}
 mkdir -p "${STACK_DIR}/site"
 for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ _ _ <<<"${entry}"
@@ -266,6 +277,9 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   # every entry is long past due, so setting a TTL later would purge the whole cache
   # at once. Remove it.
   rm -f "${STACK_DIR}"/registries/*/scheduler-state.json
+
+  # The tofu-cache images run as 101 and refuse to start on a /cache they can't write.
+  chown 101:101 "${STACK_DIR}/tofu-providers-cache" "${STACK_DIR}/tofu-git-cache"
 
   if compgen -G "${STACK_DIR}/certs/*.crt" >/dev/null; then
     chmod 644 "${STACK_DIR}"/certs/*.crt
@@ -769,7 +783,10 @@ log "Writing landing page"
     IFS=: read -r name host path <<<"${entry}"
     echo "<li><code>/repository/${name}/</code> &rarr; https://${host}${path}</li>"
   done
-  echo "</ul>"
+  echo "</ul><h2>OpenTofu</h2><ul>"
+  echo "<li><code>/repository/tofu/</code> &rarr; providers from registry.opentofu.org and registry.terraform.io (CLI <code>host</code> blocks)</li>"
+  echo "<li><code>/repository/git/github.com/</code> &rarr; public GitHub repos, for modules (git <code>insteadOf</code>)</li>"
+  echo "</ul><p>Setup: <a href=\"https://github.com/GlueOps/tofu-cache#readme\">GlueOps/tofu-cache</a></p>"
 } > "${STACK_DIR}/site/index.html"
 
 # ---------------------------------------------------------------------------
@@ -886,6 +903,27 @@ log "Writing Caddyfile"
   echo "  }"
   echo "}"
   echo
+  # tofu-cache routes: path name, upstream, response_header_timeout. The images
+  # expect the full /repository/... path, so handle, not handle_path. Credentials
+  # a client sends for a registry hostname must not reach the cache: it is
+  # public-only and never sends any upstream.
+  echo "(tofu_proxy) {"
+  echo "  handle /repository/{args[0]}/* {"
+  echo "    reverse_proxy {args[1]} {"
+  echo "      header_up -Authorization"
+  echo "      header_up -Cookie"
+  strip_forwarded
+  echo "      flush_interval -1"
+  echo "      transport http {"
+  echo "        dial_timeout 15s"
+  echo "        response_header_timeout {args[2]}"
+  echo "        read_timeout 0"
+  echo "        write_timeout 0"
+  echo "      }"
+  echo "    }"
+  echo "  }"
+  echo "}"
+  echo
 
   # ---- the route table, defined once and imported by both site blocks ----
   echo "(mirror_routes) {"
@@ -931,6 +969,14 @@ log "Writing Caddyfile"
   echo "      }"
   echo "    }"
   echo "  }"
+  echo
+
+  echo "  # ---- OpenTofu providers and GitHub modules (tofu-cache) ----"
+  echo "  import tofu_proxy tofu tofu-providers:8080 300s"
+  # A cold clone answers only once it is done: up to 330s waiting for the repo's
+  # lock plus 300s cloning (the image's own nginx allows 660s). No lb_retries:
+  # git-upload-pack is a POST.
+  echo "  import tofu_proxy git tofu-git:8080 660s"
   echo
 
   echo "  handle {"
@@ -1032,7 +1078,29 @@ compose_logging() {
   echo "    depends_on:"
   echo "      - apt-nginx"
   echo "      - content-cache"
+  echo "      - tofu-providers"
+  echo "      - tofu-git"
   echo
+  # Config is baked into these images, so they stay out of the reload loop; a new
+  # tag recreates them. Health comes from the images' own HEALTHCHECK.
+  for svc in tofu-providers tofu-git; do
+    if [[ "${svc}" == tofu-providers ]]; then img="${TOFU_PROVIDERS_IMAGE}"; else img="${TOFU_GIT_IMAGE}"; fi
+    echo "  ${svc}:"
+    echo "    image: ${img}"
+    echo "    container_name: ${svc}"
+    echo "    restart: unless-stopped"
+    compose_logging
+    echo "    read_only: true"
+    echo "    tmpfs:"
+    echo "      - /tmp:size=2g"
+    echo "    cap_drop:"
+    echo "      - ALL"
+    echo "    security_opt:"
+    echo "      - no-new-privileges:true"
+    echo "    volumes:"
+    echo "      - ${STACK_DIR}/${svc}-cache:/cache"
+    echo
+  done
   echo "  content-cache:"
   echo "    image: ${NGINX_IMAGE}"
   echo "    container_name: content-cache"
@@ -1232,6 +1300,21 @@ for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ port _ <<<"${entry}"
   check "registry ${name} /v2/" '^(200|401)$' "http://127.0.0.1:${port}/v2/"
 done
+# Own row, so a crash loop (e.g. /cache not owned by 101) isn't mistaken for
+# upstream failing the tofu checks below.
+for svc in tofu-providers tofu-git; do
+  up=0
+  for _ in $(seq 1 30); do
+    docker compose exec -T "${svc}" wget -T 3 -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 && { up=1; break; }
+    sleep 1
+  done
+  if [[ "${up}" == 1 ]]; then printf '  ok    %-30s %s\n' "${svc} /healthz" "answering"
+  else
+    printf '  FAIL  %-30s not answering  (cd %s && docker compose ps %s && docker compose logs %s)\n' \
+      "${svc} /healthz" "${STACK_DIR}" "${svc}" "${svc}"
+    failed=$((failed + 1))
+  fi
+done
 
 echo
 log "Public checks over TLS"
@@ -1292,6 +1375,38 @@ for entry in "${REGISTRIES[@]}"; do
   check "registry ${sub} TLS" '^(200|401)$' "https://${sub}.${BASE_DOMAIN}/v2/"
 done
 
+# Cold-cache misses go upstream, so a failure here while the rest pass is more
+# likely GitHub or a registry being down than the mirror. Both provider probes
+# allow 75s, just above the image's own bound for a stalled upstream (~70s), so
+# its 504 is what gets reported rather than curl giving up first.
+check "tofu providers versions" '^200$' \
+  "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/versions" \
+  --max-time 75
+# The download URL must point back here, or tofu fetches the provider from
+# GitHub directly. Fetched and asserted separately, as for the helm rewrite.
+for _ in 1 2; do
+  tofu_out="$(curl -s --max-time 75 -w '\n%{http_code}' \
+    "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/3.2.4/download/linux/amd64" 2>/dev/null)" \
+    || true
+  tofu_code="${tofu_out##*$'\n'}"
+  tofu_dl="${tofu_out%$'\n'*}"
+  [[ "${tofu_code}" == 200 ]] && break
+  sleep 2
+done
+if [[ "${tofu_code}" != 200 ]]; then
+  printf '  FAIL  %-30s could not fetch the download info (%s)\n' "tofu download_url rewrite" "${tofu_code:-000}"
+  failed=$((failed + 1))
+elif grep -qE '"download_url": ?"/repository/tofu/dl/' <<<"${tofu_dl}"; then
+  printf '  ok    %-30s download urls point here\n' "tofu download_url rewrite"
+else
+  printf '  FAIL  %-30s served, but download_url still points upstream\n' "tofu download_url rewrite"
+  failed=$((failed + 1))
+fi
+# A cold clone answers only when done (see the Caddy git route); this repo is tiny.
+check "git  info/refs" '^200$' \
+  "https://${BASE_DOMAIN}/repository/git/github.com/hashicorp/terraform-cidr-subnets.git/info/refs?service=git-upload-pack" \
+  --max-time 660
+
 echo
 if [[ "${failed}" -ne 0 ]]; then
   cat >&2 <<EOF
@@ -1314,6 +1429,7 @@ Done on ${BASE_DOMAIN}.
 
   ${#APT_REPOS[@]} apt repositories via apt-nginx, 7 registry containers (${REGISTRY_IMAGE%@*}),
   ${#HELM_REPOS[@]} helm + ${#RAW_REPOS[@]} raw via nginx.
+  OpenTofu providers and modules via ${TOFU_PROVIDERS_IMAGE%@*} and ${TOFU_GIT_IMAGE%@*}.
 
 The caches start cold. That is expected and self-correcting; the first pull of
 anything is a miss; after that raw paths revalidate and fall back to the cache.

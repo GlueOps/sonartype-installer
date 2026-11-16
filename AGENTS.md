@@ -7,7 +7,8 @@ something that has actually gone wrong, not general advice.
 
 One installer, `install-mirror-stack.sh`. It generates a `docker-compose.yml`,
 a `Caddyfile` and two nginx configs into a stack directory and brings up nginx
-(apt, helm, raw), `ghcr.io/glueops/registry` and Caddy.
+(apt, helm, raw), `ghcr.io/glueops/registry`, the two `ghcr.io/glueops/tofu-cache`
+services (OpenTofu providers and GitHub modules) and Caddy.
 
 There is no build system, no test suite and no dependency manifest. A change is
 a change to one shell script. Keep `install-mirror-stack.sh` self-contained:
@@ -208,6 +209,30 @@ fault.
 **Ubuntu is amd64-only through `archive.ubuntu.com`.** arm64, ppc64el and s390x
 live on `ports.ubuntu.com/ubuntu-ports`. Debian is unaffected — `deb.debian.org`
 carries every architecture.
+
+**The tofu-cache services run as uid 101 with a read-only root.** Their
+`/cache` bind mounts are `chown 101:101` on every real run (not under
+`DRY_RUN`, which CI runs without root); without it both containers crash-loop.
+Their config is baked into the images, so they stay out of the reload loop and
+need no `mirror.cache-zones` label: a new tag recreates them. The git route's
+`response_header_timeout` (660s) must stay above the image's lock wait plus clone
+limit (330s + 300s), because a cold clone answers only once it is done. The
+IPv4-only rule above is met inside the images: providers resolves every upstream
+per request through `resolver 127.0.0.11 ipv6=off`, and git only contacts
+github.com, which has no AAAA records.
+
+## Decisions
+
+Settled; don't re-raise in review.
+
+- No rollback runbook for the tofu-cache services: roll forward.
+- The tofu-cache disk budget (about 41 GB on top of the rest) is accepted; hosts
+  have the space.
+- `/repository/git/` clones any public GitHub repo for anyone, with no allowlist
+  or rate limit, as the pull-through registries already serve any image. Accepted:
+  many large clones at once can hold all 64 git workers (up to ~11 min each) and
+  overshoot the 20 GB cap between 10-minute sweeps, on the disk every cache here
+  shares. Per-client limits are deferred in tofu-cache's own Decisions.
 
 ## Do not change client-facing URLs
 

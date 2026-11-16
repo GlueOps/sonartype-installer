@@ -216,7 +216,10 @@ carries every architecture.
 Their config is baked into the images, so they stay out of the reload loop and
 need no `mirror.cache-zones` label: a new tag recreates them. The git route's
 `response_header_timeout` (660s) must stay above the image's lock wait plus clone
-limit (330s + 300s), because a cold clone answers only once it is done.
+limit (330s + 300s), because a cold clone answers only once it is done. The
+IPv4-only rule above is met inside the images: providers resolves every upstream
+per request through `resolver 127.0.0.11 ipv6=off`, and git only contacts
+github.com, which has no AAAA records.
 
 ## Decisions
 

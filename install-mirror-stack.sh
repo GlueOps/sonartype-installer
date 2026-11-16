@@ -903,6 +903,27 @@ log "Writing Caddyfile"
   echo "  }"
   echo "}"
   echo
+  # tofu-cache routes: path name, upstream, response_header_timeout. The images
+  # expect the full /repository/... path, so handle, not handle_path. Credentials
+  # a client sends for a registry hostname must not reach the cache: it is
+  # public-only and never sends any upstream.
+  echo "(tofu_proxy) {"
+  echo "  handle /repository/{args[0]}/* {"
+  echo "    reverse_proxy {args[1]} {"
+  echo "      header_up -Authorization"
+  echo "      header_up -Cookie"
+  strip_forwarded
+  echo "      flush_interval -1"
+  echo "      transport http {"
+  echo "        dial_timeout 15s"
+  echo "        response_header_timeout {args[2]}"
+  echo "        read_timeout 0"
+  echo "        write_timeout 0"
+  echo "      }"
+  echo "    }"
+  echo "  }"
+  echo "}"
+  echo
 
   # ---- the route table, defined once and imported by both site blocks ----
   echo "(mirror_routes) {"
@@ -950,44 +971,12 @@ log "Writing Caddyfile"
   echo "  }"
   echo
 
-  # OpenTofu: the images expect the full /repository/... path, so handle, not
-  # handle_path. Credentials a client sends for a registry hostname must not reach
-  # the cache: it is public-only and never sends any upstream.
   echo "  # ---- OpenTofu providers and GitHub modules (tofu-cache) ----"
-  echo "  @tofu path /repository/tofu/*"
-  echo "  handle @tofu {"
-  echo "    reverse_proxy tofu-providers:8080 {"
-  echo "      header_up -Authorization"
-  echo "      header_up -Cookie"
-  strip_forwarded
-  echo "      flush_interval -1"
-  echo "      transport http {"
-  echo "        dial_timeout 15s"
-  echo "        response_header_timeout 300s"
-  echo "        read_timeout 0"
-  echo "        write_timeout 0"
-  echo "      }"
-  echo "    }"
-  echo "  }"
-  echo
+  echo "  import tofu_proxy tofu tofu-providers:8080 300s"
   # A cold clone answers only once it is done: up to 330s waiting for the repo's
   # lock plus 300s cloning (the image's own nginx allows 660s). No lb_retries:
   # git-upload-pack is a POST.
-  echo "  @git path /repository/git/*"
-  echo "  handle @git {"
-  echo "    reverse_proxy tofu-git:8080 {"
-  echo "      header_up -Authorization"
-  echo "      header_up -Cookie"
-  strip_forwarded
-  echo "      flush_interval -1"
-  echo "      transport http {"
-  echo "        dial_timeout 15s"
-  echo "        response_header_timeout 660s"
-  echo "        read_timeout 0"
-  echo "        write_timeout 0"
-  echo "      }"
-  echo "    }"
-  echo "  }"
+  echo "  import tofu_proxy git tofu-git:8080 660s"
   echo
 
   echo "  handle {"

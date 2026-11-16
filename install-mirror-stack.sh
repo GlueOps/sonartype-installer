@@ -1300,12 +1300,12 @@ for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ port _ <<<"${entry}"
   check "registry ${name} /v2/" '^(200|401)$' "http://127.0.0.1:${port}/v2/"
 done
-# A row of its own, or a crash loop (e.g. /cache not owned by 101) shows up only
-# as the tofu checks below failing, under a comment that blames upstream.
+# Own row, so a crash loop (e.g. /cache not owned by 101) isn't mistaken for
+# upstream failing the tofu checks below.
 for svc in tofu-providers tofu-git; do
   up=0
   for _ in $(seq 1 30); do
-    docker compose exec -T "${svc}" wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 && { up=1; break; }
+    docker compose exec -T "${svc}" wget -T 3 -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 && { up=1; break; }
     sleep 1
   done
   if [[ "${up}" == 1 ]]; then printf '  ok    %-30s %s\n' "${svc} /healthz" "answering"
@@ -1377,7 +1377,9 @@ done
 
 # Cold-cache misses go upstream, so a failure here while the rest pass is more
 # likely GitHub or a registry being down than the mirror.
-check "tofu providers versions" '^200$' "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/versions"
+check "tofu providers versions" '^200$' \
+  "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/versions" \
+  --max-time 75
 # The download URL must point back here, or tofu fetches the provider from
 # GitHub directly. Fetched and asserted separately, as for the helm rewrite.
 # --max-time sits just above the image's own bound for a stalled upstream (~70s),

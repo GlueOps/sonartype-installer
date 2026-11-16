@@ -1293,20 +1293,27 @@ for entry in "${REGISTRIES[@]}"; do
   done
 done
 
-log "Waiting for the tofu-cache services"
-for svc in tofu-providers tofu-git; do
-  for _ in $(seq 1 30); do
-    docker compose exec -T "${svc}" wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
-    sleep 1
-  done
-done
-
 echo
 log "Local checks"
 check "healthz" '^200$' "$(local_url /healthz)" "${RESOLVE[@]}"
 for entry in "${REGISTRIES[@]}"; do
   IFS=: read -r name _ port _ <<<"${entry}"
   check "registry ${name} /v2/" '^(200|401)$' "http://127.0.0.1:${port}/v2/"
+done
+# A row of its own, or a crash loop (e.g. /cache not owned by 101) shows up only
+# as the tofu checks below failing, under a comment that blames upstream.
+for svc in tofu-providers tofu-git; do
+  up=0
+  for _ in $(seq 1 30); do
+    docker compose exec -T "${svc}" wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 && { up=1; break; }
+    sleep 1
+  done
+  if [[ "${up}" == 1 ]]; then printf '  ok    %-30s %s\n' "${svc} /healthz" "answering"
+  else
+    printf '  FAIL  %-30s not answering  (cd %s && docker compose ps %s && docker compose logs %s)\n' \
+      "${svc} /healthz" "${STACK_DIR}" "${svc}" "${svc}"
+    failed=$((failed + 1))
+  fi
 done
 
 echo

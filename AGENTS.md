@@ -7,7 +7,8 @@ something that has actually gone wrong, not general advice.
 
 One installer, `install-mirror-stack.sh`. It generates a `docker-compose.yml`,
 a `Caddyfile` and two nginx configs into a stack directory and brings up nginx
-(apt, helm, raw), `ghcr.io/glueops/registry` and Caddy.
+(apt, helm, raw), `ghcr.io/glueops/registry`, the two `ghcr.io/glueops/tofu-cache`
+services (OpenTofu providers and GitHub modules) and Caddy.
 
 There is no build system, no test suite and no dependency manifest. A change is
 a change to one shell script. Keep `install-mirror-stack.sh` self-contained:

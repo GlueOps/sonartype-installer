@@ -1376,14 +1376,14 @@ for entry in "${REGISTRIES[@]}"; do
 done
 
 # Cold-cache misses go upstream, so a failure here while the rest pass is more
-# likely GitHub or a registry being down than the mirror.
+# likely GitHub or a registry being down than the mirror. Both provider probes
+# allow 75s, just above the image's own bound for a stalled upstream (~70s), so
+# its 504 is what gets reported rather than curl giving up first.
 check "tofu providers versions" '^200$' \
   "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/versions" \
   --max-time 75
 # The download URL must point back here, or tofu fetches the provider from
 # GitHub directly. Fetched and asserted separately, as for the helm rewrite.
-# --max-time sits just above the image's own bound for a stalled upstream (~70s),
-# so its 504 is what gets reported rather than curl giving up first.
 for _ in 1 2; do
   tofu_out="$(curl -s --max-time 75 -w '\n%{http_code}' \
     "https://${BASE_DOMAIN}/repository/tofu/registry.opentofu.org/v1/providers/hashicorp/null/3.2.4/download/linux/amd64" 2>/dev/null)" \

@@ -35,8 +35,8 @@
 #   STACK_DIR           default /opt/mirror-stack
 #   REGISTRY_IMAGE      registry image, tag@digest (default: pinned ghcr.io/glueops/registry)
 #   NGINX_IMAGE         nginx image for apt-nginx and content-cache, tag@digest
-#   TOFU_PROVIDERS_IMAGE  OpenTofu provider cache image (default: tofu-cache v0.0.1)
-#   TOFU_GIT_IMAGE        GitHub module cache image (default: tofu-cache v0.0.1)
+#   TOFU_PROVIDERS_IMAGE  OpenTofu provider cache image, tag@digest (default: tofu-cache v0.0.1)
+#   TOFU_GIT_IMAGE        GitHub module cache image, tag@digest (default: tofu-cache v0.0.1)
 #   APT_CACHE_MAX_SIZE  apt package cache ceiling, default 40g
 #   APT_CACHE_MIN_FREE  free disk the apt cache always leaves, default 10g
 #   LOG_MAX_SIZE        per-container log file size before rotation, default 50m
@@ -72,8 +72,8 @@ REGISTRY_IMAGE="${REGISTRY_IMAGE:-ghcr.io/glueops/registry:v0.0.2@sha256:8cb6fbe
 
 # OpenTofu provider and GitHub module caches; their cache limits are baked in.
 # https://github.com/GlueOps/tofu-cache
-TOFU_PROVIDERS_IMAGE="${TOFU_PROVIDERS_IMAGE:-ghcr.io/glueops/tofu-cache-providers:v0.0.1}"
-TOFU_GIT_IMAGE="${TOFU_GIT_IMAGE:-ghcr.io/glueops/tofu-cache-git:v0.0.1}"
+TOFU_PROVIDERS_IMAGE="${TOFU_PROVIDERS_IMAGE:-ghcr.io/glueops/tofu-cache-providers:v0.0.1@sha256:9e7512a4977226614af532c6764c9f4e7fa55a72aefcd941b2caa8ffc12994d5}"
+TOFU_GIT_IMAGE="${TOFU_GIT_IMAGE:-ghcr.io/glueops/tofu-cache-git:v0.0.1@sha256:0e6811b48b0eee5f5d90df1717c68ad9fb07634bd3c291c67ac5ac26e8a33c56}"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 log(){ echo "==> $*"; }

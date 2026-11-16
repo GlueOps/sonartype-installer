@@ -225,8 +225,6 @@ github.com, which has no AAAA records.
 
 Settled; don't re-raise in review.
 
-- `TOFU_PROVIDERS_IMAGE` / `TOFU_GIT_IMAGE` pin the `v0.0.1` tag without a digest,
-  so this was ready before that release existed. Adding the digest later is optional.
 - No rollback runbook for the tofu-cache services: roll forward.
 - The tofu-cache disk budget (about 41 GB on top of the rest) is accepted; hosts
   have the space.

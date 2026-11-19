@@ -55,7 +55,7 @@ ACME_EMAIL="${ACME_EMAIL:-}"
 
 # apt-nginx and content-cache. Pinned: the apt config is tested against this
 # version, and `resolve` in upstream blocks needs 1.27.3+.
-NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.31.6-alpine@sha256:d10753d9289b8e3f884386351f73554ce72b631378949deddd75e83ee296c427}"
+NGINX_IMAGE="${NGINX_IMAGE:-nginx:1.31.9-alpine@sha256:90b6bd2aec278b16b98221d64deb1d6d35d164567f507ab0716e6053878315aa}"
 # The apt package cache. min_free is what keeps it from filling a disk the
 # registries share: nginx evicts rather than write past it.
 APT_CACHE_MAX_SIZE="${APT_CACHE_MAX_SIZE:-40g}"

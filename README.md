@@ -36,7 +36,7 @@ registry cache uses the `filesystem` storage driver; apt, helm and raw cache in
 | layer | setting | effect |
 | --- | --- | --- |
 | apt-nginx (packages) | `inactive=45d` + `APT_CACHE_MAX_SIZE` (40g) | LRU; a file unused for 45 days is dropped |
-| apt-nginx (indexes) | `1s`, revalidated, stale on error | fresh on every `apt-get update`, last good copy in an outage |
+| apt-nginx (indexes) | `1s`, revalidated, stale on error | fresh on every `apt-get update`, last good copy in an outage or while an upstream is switched offline (`apt-upstream`) |
 | nginx (raw) | always revalidate, stale on error | those are stable paths whose *content moves* |
 | nginx (helm index) | `5m` | an index is the thing that moves |
 | nginx (eviction) | `inactive=365d` + `max_size` | LRU, disk pressure only |
@@ -68,8 +68,8 @@ cat /root/.docker/config.json     # an auths entry for the registry
 docker logout <registry>
 ```
 
-`DRY_RUN=1` writes the compose file, Caddyfile, `nginx.conf` and
-`apt-nginx.conf` and stops.
+`DRY_RUN=1` writes the compose file, Caddyfile, `nginx.conf`,
+`apt-nginx.conf` and the `apt-upstream` helper, and stops.
 
 ### Upgrading a host that ran apt-cacher-ng
 
@@ -174,7 +174,9 @@ and the rest are rewritten in place on every publish, and apt fails with `File
 has unexpected size` when it gets an `InRelease` and a `Packages` from different
 publishes. A short lifetime, no background refresh and no `updating` in
 `proxy_cache_use_stale` keep them from the same publish; the last good copy is
-still served when the upstream errors or times out. Revalidation sends only
+still served when the upstream errors or times out. A slow upstream that still
+answers is neither, so every update waits on it; `apt-upstream offline` (below)
+is the switch for that. Revalidation sends only
 `If-Modified-Since`, so a lagging mirror answers 304 instead of replacing a newer
 copy with an older one.
 
@@ -210,6 +212,105 @@ Runbooks:
   refuses the cached copy. That needs a change on the nodes, not the mirror:
   `Acquire::Check-Valid-Until "false";` in `/etc/apt/apt.conf.d/`, removed afterwards.
 - **A new Kubernetes minor.** Add its row to `APT_REPOS` and re-run.
+- **An upstream is slow but up.** See [Taking an apt upstream offline](#taking-an-apt-upstream-offline).
+
+### Taking an apt upstream offline
+
+When an upstream is slow but still answering, apt-nginx's stale-on-error never
+kicks in and every `apt-get update` waits on it. `apt-upstream` stops apt-nginx
+from contacting one upstream host, so its **indexes** come from the cache:
+
+```sh
+sudo apt-upstream                                              # status of all 7 upstreams
+sudo apt-upstream offline archive.ubuntu.com --reason 'slow upstream (14 KB/s)'
+sudo apt-upstream online archive.ubuntu.com                    # or: online all
+sudo apt-upstream help                                         # the upstreams and the repositories each serves
+```
+
+- **What it does not speed up.** Packages and by-hash index files this mirror
+  has not cached still come from the upstream. An index this region never cached
+  answers 503; apt warns, keeps the node's old lists and carries on.
+- **Per region, per upstream host.** Repository names are refused: one host
+  serves several (`ubuntu-noble` is `archive.ubuntu.com`, with five others). When
+  clients use the global name, switch a host in every region together. The
+  state lives in `/opt/mirror-stack/apt-offline/` and survives installer re-runs,
+  which print a `WARNING` for every upstream still offline.
+- **Nothing expires it; bring it back.** New security updates don't arrive
+  while `security.*` is offline. Debian `-security`, `trixie-updates` and the
+  `-backports` suites expire about 7 days after their cached date; past that,
+  use the expired-suite runbook above.
+- **docker and kubernetes have no by-hash indexes.** If either publishes within
+  seconds of being switched offline, clients can get `File has unexpected size`
+  for that repository: `sudo apt-upstream online <host>` clears it at once.
+- **Quote the reason.** `--reason` takes the rest of the line, and an unquoted
+  `#` or `(` is eaten by the shell.
+- **Rolling out.** The first run with this switch adds a mount, so apt-nginx is
+  recreated: up to 10-15s of 502s under load, and long downloads in flight are
+  cut. One region at a time, off-peak, and not while an upstream is degraded.
+- **Rolling back.** `sudo apt-upstream online all` first. An older release has
+  no switch and recreates apt-nginx again; any offline files are ignored and
+  come back into force on the next upgrade. The helper stays on the host, so
+  there `status` shows `SWITCH INACTIVE` and `offline` exits 4.
+
+Which upstream is slow (indexes over the last 10 minutes, per host):
+
+```sh
+sudo docker logs --since 10m apt-nginx 2>&1 | awk '$1=="fetch" && $NF ~ /^\/idx\// {split($NF,p,"/"); h=p[3]; n[h]++; t[h]+=$(NF-1); if ($(NF-1)+0>5) s[h]++} END {for (h in n) printf "%-28s %5d idx  avg %.1fs  %d over 5s\n", h, n[h], t[h]/n[h], s[h]}'
+```
+
+Once a host is offline its rows read about 0s, so decide when to bring it back
+with a probe from inside apt-nginx (IPv4, as nginx fetches). Healthy is roughly
+under 2s:
+
+| upstream | probe |
+| --- | --- |
+| archive.ubuntu.com | `https://archive.ubuntu.com/ubuntu/dists/noble/InRelease` |
+| security.ubuntu.com | `https://security.ubuntu.com/ubuntu/dists/noble-security/InRelease` |
+| deb.debian.org | `https://deb.debian.org/debian/dists/trixie/InRelease` |
+| security.debian.org | `https://security.debian.org/debian-security/dists/trixie-security/InRelease` |
+| prod-cdn.packages.k8s.io | `https://prod-cdn.packages.k8s.io/repositories/isv:/kubernetes:/core:/stable:/v1.34/deb/InRelease` |
+| download.docker.com | `https://download.docker.com/linux/ubuntu/dists/noble/InRelease` |
+| packages.buildkite.com | `https://packages.buildkite.com/helm-linux/helm-debian/any/dists/any/InRelease` (redirects: keep `-L`) |
+
+```sh
+sudo docker exec apt-nginx curl -4 -sL -o /dev/null -m 30 -w '%{http_code} %{time_total}s\n' <probe>
+```
+
+Clients are being served from cache, and none are failing (cache tier, last 5 minutes):
+
+```sh
+sudo docker logs --since 5m apt-nginx 2>&1 | grep -c ' STALE \[503\] .*InRelease'     # served from cache
+sudo docker logs --since 5m apt-nginx 2>&1 | grep -c ' 503 MISS \[503\] .* /repository/'  # any index never cached here: failing
+```
+
+All three regions from your workstation. The remote shell re-parses the command,
+so the arguments are quoted with `printf %q`; `BatchMode` stops a missing key
+from hanging the loop:
+
+```sh
+run_all(){ local h failed=() cmd; cmd="test -x /usr/local/sbin/apt-upstream || exit 127; sudo -n apt-upstream$(printf ' %q' "$@")"
+  for h in repo.{us-east,us-west,eu-central}.example.com; do
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" "$cmd" || failed+=("$h:$?")
+  done; echo "failed: ${failed[*]:-none}"; }
+run_all offline archive.ubuntu.com --reason 'slow upstream (14 KB/s)'
+run_all status --warn
+run_all online archive.ubuntu.com
+```
+
+Exit codes: `0` done, `2` usage, `4` written but apt-nginx can't see it yet (run
+`sudo apt-upstream` there), `1` failed (or `sudo:` refused: no rule),
+`127` that region isn't on a release with `apt-upstream` yet, `255` ssh failed.
+Non-interactive `sudo -n` needs a rule in a file **without a dot in its name**
+(sudo skips `apt-upstream.conf` silently), safe only while `/opt/mirror-stack`
+is root-owned:
+
+```sh
+f="$(mktemp)"; echo '<user> ALL=(root) NOPASSWD: /usr/local/sbin/apt-upstream' > "$f"
+sudo visudo -cf "$f" && sudo install -m 0440 "$f" /etc/sudoers.d/apt-upstream; rm -f "$f"
+```
+
+Without one, run it per host with `ssh -t`.
+
 
 ### Helm and raw go through nginx
 

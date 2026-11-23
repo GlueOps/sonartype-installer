@@ -6,12 +6,14 @@ something that has actually gone wrong, not general advice.
 ## What this repository is
 
 One installer, `install-mirror-stack.sh`. It generates a `docker-compose.yml`,
-a `Caddyfile` and two nginx configs into a stack directory and brings up nginx
+a `Caddyfile`, two nginx configs and the `apt-upstream` offline-switch helper
+into a stack directory and brings up nginx
 (apt, helm, raw), `ghcr.io/glueops/registry`, the two `ghcr.io/glueops/tofu-cache`
 services (OpenTofu providers and GitHub modules) and Caddy.
 
-There is no build system, no test suite and no dependency manifest. A change is
-a change to one shell script. Keep `install-mirror-stack.sh` self-contained:
+There is no build system and no dependency manifest. A change is a change to one
+shell script; the only test is `ci/test-apt-upstream.sh`, which CI runs against
+the dry-run output (it is not shipped to hosts). Keep `install-mirror-stack.sh` self-contained:
 hosts download that one file by tag and checksum, so a config file next to it
 would never reach them.
 
@@ -22,7 +24,14 @@ pushing:
 
 ```bash
 docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable \
-  --severity=warning install-mirror-stack.sh
+  --severity=warning install-mirror-stack.sh ci/test-apt-upstream.sh
+```
+
+The generated `apt-upstream` is a quoted heredoc that this never sees; the
+`dry-run` job shellchecks the generated file. Locally, after a `DRY_RUN=1` run:
+
+```bash
+docker run --rm -v "$STACK_DIR:/mnt" koalaman/shellcheck:stable --severity=warning /mnt/apt-upstream
 ```
 
 **Conventional Commits are validated on every commit message in the PR**, not on
@@ -32,7 +41,11 @@ without a prefix, `git reset --soft` to the base and recommit rather than adding
 a fixup.
 
 **The `dry-run` job** generates both shapes with `DRY_RUN=1`, then runs `nginx -t`
-on both nginx configs offline, `caddy validate` and `docker compose config`. A
+on both nginx configs offline, `caddy validate` and `docker compose config`,
+greps that the offline switch is mounted, sits in `/idx/` exactly once and is
+backed by `http_503` in the index `proxy_cache_use_stale`, shellchecks the
+generated helper, and runs `ci/test-apt-upstream.sh` against a `--network none`
+apt-nginx. A
 bare-hostname `proxy_pass` without an `upstream … resolve` block fails there,
 because the job has no DNS.
 
@@ -50,12 +63,36 @@ docker run --rm -v /tmp/x/Caddyfile:/etc/caddy/Caddyfile:ro \
 Exercise both shapes. With `GLOBAL_BASE_DOMAIN` set you should get 16 site
 blocks; without it, 8 and no `globalcert` snippet.
 
+The offline switch: `ci/test-apt-upstream.sh <STACK_DIR>` on the dry-run output
+(needs docker and passwordless sudo), pointed at the exact `STACK_DIR` the helper
+was generated with (it is baked into the helper). It starts a container named
+exactly `apt-nginx` and refuses to run if one it didn't start exists, and its
+`STACK_DIR` must be a path the Docker daemon can bind-mount. It can't show a stale serve (no
+network); check that once by hand against the real upstreams after changing
+the index path.
+
 The whole stack also runs locally: rewrite the site addresses to `http://…`,
 drop the `tls` directive, map port 80 to something unprivileged, and probe with
 `-H "Host: …"`. Every route in this repository was verified that way against the
 real upstreams before shipping.
 
 ## Landmines
+
+**The offline switch lives in fetch-tier `location /idx/` only.** The
+`if ($fetch_scheme = "") { return 403; }` line it follows also opens `location /`;
+a copy there makes every uncached package fail with 503. It only works because
+the cache tier's index `proxy_cache_use_stale` includes `http_503`, so keep that,
+and keep `open_file_cache` off (the per-request stat is the switch). The
+`apt-offline/` directory is operator state: the installer sets its mode (nginx
+workers, uid 101, must search it, or the switch silently does nothing) and never
+touches or replaces its contents. Replacing the directory itself strands the
+running container on the old inode.
+
+**`apt-upstream` is generated from a quoted heredoc** with the unique delimiter
+`APT_UPSTREAM_HELPER`: an `EOF` inside it would end the outer heredoc and run the
+rest as installer code. It is written before the `DRY_RUN` exit so CI can test
+it. Writing it with `install` and its state files with mktemp + `mv` is correct:
+the write-in-place rule below is for single-file bind mounts.
 
 **Caddy rejects one-liner blocks.** `transport http { tls }` on a single line is
 a parse error. It is also redundant — an `https://` upstream enables TLS by
@@ -83,7 +120,7 @@ container when the *service definition* changes — image, environment, volume
 list — not when the contents of a bind-mounted file change. So the script
 reloads Caddy and both nginx containers on every run, not when a checksum
 changes: a run that died after writing a file would otherwise leave the old
-config serving on every rerun. Write config files in place (`> file`); `cp`,
+config serving on every rerun. Write single-file-mounted config files in place (`> file`); `cp`,
 `mv` or `sed -i` replace the inode and the running container keeps the old one.
 
 **`nginx -t` passing does not mean the reload worked.** A changed cache zone
@@ -224,6 +261,20 @@ github.com, which has no AAAA records.
 ## Decisions
 
 Settled; don't re-raise in review.
+
+- The apt offline switch (`apt-upstream`) is manual and never expires. The
+  operator brings a host back. Accepted cost: `security.debian.org` and
+  `deb.debian.org`'s `trixie-updates` and `-backports` suites carry `Valid-Until`
+  7 days after their cached `Date`, so leaving them offline longer makes Debian
+  clients fail; other hosts just stop receiving new security updates.
+- All 7 apt upstreams are switchable, including `download.docker.com` and
+  `prod-cdn.packages.k8s.io`, which publish no by-hash indexes. Accepted: a
+  publish within seconds of an offline flip can freeze a mismatched
+  `InRelease`/`Packages` pair (`File has unexpected size` for that repo) until
+  `apt-upstream online <host>`, which heals it at once. The same mismatch can
+  already happen during a real upstream outage.
+- No automation for the switch (no monitor, no auto-failover, no expiry timer),
+  and no index-snapshot service for docker/k8s. Both were designed and declined.
 
 - No rollback runbook for the tofu-cache services: roll forward.
 - The tofu-cache disk budget (about 41 GB on top of the rest) is accepted; hosts

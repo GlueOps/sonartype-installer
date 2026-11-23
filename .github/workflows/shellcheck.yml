@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run shellcheck
-        run: shellcheck --severity=warning install-mirror-stack.sh
+        run: shellcheck --severity=warning install-mirror-stack.sh ci/test-apt-upstream.sh
 
   # Generates every config the installer writes, in both site shapes, and checks
   # each one with the tool that will load it.
@@ -40,6 +40,15 @@ jobs:
             docker compose -f "$RUNNER_TEMP/$d/docker-compose.yml" config --quiet
           done
           test "$(grep -cE '^[a-z0-9][a-z0-9.-]* \{$' "$RUNNER_TEMP/r/Caddyfile")" -eq 8
+          # The offline switch: mounted, checked in /idx/ only, and backed by stale-on-503.
+          for d in r g; do
+            grep -qF 'apt-offline:/etc/nginx/apt-offline:ro' "$RUNNER_TEMP/$d/docker-compose.yml"
+            # shellcheck disable=SC2016 # literal nginx variable
+            test "$(grep -cF 'if (-f /etc/nginx/apt-offline/$fetch_host)' "$RUNNER_TEMP/$d/apt-nginx.conf")" -eq 1
+            grep -A1 -E 'proxy_cache_use_stale error timeout invalid_header$' "$RUNNER_TEMP/$d/apt-nginx.conf" | grep -q 'http_503'
+          done
+          # The helper is a quoted heredoc, invisible to the shellcheck job.
+          shellcheck --severity=warning "$RUNNER_TEMP/r/apt-upstream" "$RUNNER_TEMP/g/apt-upstream"
           test "$(grep -cE '^[a-z0-9][a-z0-9.-]* \{$' "$RUNNER_TEMP/g/Caddyfile")" -eq 16
       - name: nginx -t, offline
         run: |
@@ -47,6 +56,8 @@ jobs:
           docker run --rm --network none -v "$RUNNER_TEMP/r/apt-nginx.conf:/etc/nginx/nginx.conf:ro" "$img" \
             sh -c 'mkdir -p /var/cache/apt-nginx && nginx -t'
           docker run --rm --network none -v "$RUNNER_TEMP/r/nginx.conf:/etc/nginx/nginx.conf:ro" "$img" nginx -t
+      - name: apt-upstream against apt-nginx, offline
+        run: ci/test-apt-upstream.sh "$RUNNER_TEMP/r"
       - name: caddy validate
         run: |
           img="$(awk '$1 == "image:" && $2 ~ /^caddy:/ {print $2; exit}' "$RUNNER_TEMP/r/docker-compose.yml")"
